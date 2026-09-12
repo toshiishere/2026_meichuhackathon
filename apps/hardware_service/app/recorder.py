@@ -32,6 +32,9 @@ FRAME_SCHEMA = pa.schema(
         ("video_pts_s", pa.float64()),
         ("host_timestamp_ns", pa.int64()),
         ("wall_timestamp_utc", pa.string()),
+        ("phone_frame_idx", pa.int64()),
+        ("phone_capture_timestamp_ms", pa.float64()),
+        ("phone_skipped_frames_total", pa.int64()),
     ]
 )
 
@@ -230,13 +233,21 @@ class Recorder:
                     )
                 with self.lock:
                     s = self.camera_stats
+                    s.update(getattr(source, "transport_stats", {}))
                     s["frames_acquired"] += 1
                     s["first_timestamp_ns"] = s["first_timestamp_ns"] or stamp
                     s["last_timestamp_ns"] = stamp
                     span = (stamp - s["first_timestamp_ns"]) / 1e9
                     s["actual_fps"] = (s["frames_acquired"] - 1) / span if span else 0
                 try:
-                    q.put_nowait((frame, stamp, utc_now()))
+                    q.put_nowait(
+                        (
+                            frame,
+                            stamp,
+                            utc_now(),
+                            dict(getattr(source, "frame_metadata", {})),
+                        )
+                    )
                 except queue.Full:
                     with self.lock:
                         self.camera_stats["queue_drops"] += 1
@@ -321,7 +332,7 @@ class Recorder:
             parquet = pq.ParquetWriter(frames_temp, FRAME_SCHEMA, compression="zstd")
             ready.set()
             rows, idx, last_pts = [], 0, -1
-            for frame, stamp, wall in self._items(q, done):
+            for frame, stamp, wall, frame_metadata in self._items(q, done):
                 if self.first_video_ns is None:
                     self.first_video_ns = stamp
                 pts = max(last_pts + 1, (stamp - self.first_video_ns) // 1000)
@@ -332,7 +343,8 @@ class Recorder:
                     container.mux(packet)
                 rows.append(
                     dict(
-                        schema_version=SCHEMA_VERSION,
+                        schema_version="1.1",
+                        **frame_metadata,
                         frame_idx=idx,
                         video_pts=pts,
                         video_time_base_num=1,
@@ -380,9 +392,15 @@ class Recorder:
             clock={
                 "source": "time.monotonic_ns",
                 "csi_timestamp": "complete serial line receipt",
-                "camera_timestamp": "camera read completion",
+                "camera_timestamp": (
+                    "phone frame websocket arrival on collector"
+                    if self.config.camera.device.startswith("phone://")
+                    else "camera read completion"
+                ),
+                "phone_capture_clock": "performance.now milliseconds; unaligned with host clock",
+                "video_frames_schema_version": "1.1",
                 "video_pts_origin": "first encoded frame",
-                "limitations": "USB, serial and camera driver buffering introduce unmeasured latency",
+                "limitations": "USB, serial, camera driver buffering, and phone JPEG encoding/network transport introduce unmeasured latency",
             },
             software={
                 **provenance,
@@ -418,13 +436,18 @@ class Recorder:
                     sample = source.read(self.stop)
                     if sample:
                         try:
-                            serial_ready = parse_csi(sample[0].decode(errors="replace")) is not None
+                            serial_ready = (
+                                parse_csi(sample[0].decode(errors="replace"))
+                                is not None
+                            )
                         except ValueError:
                             continue
                         if serial_ready:
                             break
                 if not serial_ready:
-                    raise RuntimeError(f"{rx.logical_name}: no valid CSI after opening the recording handle")
+                    raise RuntimeError(
+                        f"{rx.logical_name}: no valid CSI after opening the recording handle"
+                    )
                 temp = self.path / "raw" / f".csi_{rx.logical_name}.csv.zst.tmp"
                 self.artifacts.append(
                     (temp, temp.with_name(f"csi_{rx.logical_name}.csv.zst"))
@@ -568,7 +591,9 @@ class Recorder:
                         os.rename(temp, final)
                 except Exception as e:
                     self.fail("finalization", str(e))
-            self.last_bytes = sum(p.stat().st_size for p in self.path.rglob('*') if p.is_file())
+            self.last_bytes = sum(
+                p.stat().st_size for p in self.path.rglob("*") if p.is_file()
+            )
             self.state = "incomplete" if self.errors else "complete"
             snapshot = self.snapshot()
             degraded = (
@@ -580,6 +605,8 @@ class Recorder:
                     for n, s in self.stats.items()
                 )
                 or self.camera_stats["queue_drops"]
+                or self.camera_stats.get("phone_queue_drops", 0)
+                or self.camera_stats.get("phone_skipped_frames", 0)
             )
             degraded = degraded or any(
                 r["average_rate_hz"]
@@ -593,11 +620,9 @@ class Recorder:
             )
             metadata.update(
                 status=self.state,
-                quality="incomplete"
-                if self.errors
-                else "degraded"
-                if degraded
-                else "good",
+                quality=(
+                    "incomplete" if self.errors else "degraded" if degraded else "good"
+                ),
                 stop_timestamp_ns=self.end_ns,
                 finished_at=utc_now(),
                 duration_seconds=snapshot["elapsed_seconds"],

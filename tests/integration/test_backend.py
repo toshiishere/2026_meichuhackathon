@@ -44,6 +44,18 @@ def test_backend_registry_artifacts_and_request_validation(tmp_path, monkeypatch
         assert client.post("/api/devices", json=board).status_code == 200
         assert client.get("/api/devices").json()[0]["logical_name"] == "rx_left"
         assert client.get("/api/sessions").json()[0]["session_id"] == "session1"
+        main.registry.put(
+            "sessions", "removed", {"session_id": "removed", "status": "complete"}
+        )
+        client.get("/api/sessions")
+        assert main.registry.get("sessions", "removed") is None
+        for host in ["collector.local", "203.0.113.10"]:
+            monkeypatch.setenv("PHONE_HOST", host)
+            monkeypatch.setenv("PHONE_HTTPS_PORT", "8443")
+            assert (
+                client.get("/api/health").json()["phone_origin"]
+                == f"https://{host}:8443"
+            )
         assert (
             client.get("/api/sessions/session1/files/raw/csi_rx.csv.zst").content
             == b"raw-content"

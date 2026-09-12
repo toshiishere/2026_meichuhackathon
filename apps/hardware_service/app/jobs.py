@@ -93,9 +93,9 @@ class Jobs:
         if not job:
             raise KeyError(jid)
         if jid == self.current and self.cancel_event:
-            if job["kind"] == "flash":
+            if job["kind"] in {"flash", "session-remove"}:
                 raise ValueError(
-                    "Firmware jobs cannot be cancelled during a flash; wait for completion"
+                    "Firmware writes and session removal cannot be cancelled mid-operation; wait for completion"
                 )
             self.cancel_event.set()
         return job

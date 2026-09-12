@@ -11,4 +11,4 @@ COPY tests tests
 COPY pytest.ini pytest.ini
 RUN pip install --no-cache-dir -r tests/requirements.txt
 ENV PYTHONUNBUFFERED=1 DATA_DIR=/data HARDWARE_MODE=synthetic
-CMD ["uvicorn", "apps.hardware_service.app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "apps.hardware_service.app.main:app", "--host", "0.0.0.0", "--port", "8001", "--ws-max-size", "2097152"]

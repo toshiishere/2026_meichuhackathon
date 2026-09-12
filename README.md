@@ -1,6 +1,6 @@
 # CSI Collection Lab
 
-A Docker-first web application for **synchronized WiFi CSI and USB camera collection**.
+A Docker-first web application for **synchronized WiFi CSI and USB or phone camera collection**.
 Configure ESP32 boards, verify receiver/camera health, record multiple receivers
 and a camera together, and inspect immutable raw sessions.
 
@@ -45,7 +45,7 @@ flashing is unavailable there.
 ## Real hardware
 
 Required: an ESP32 sender and one or more ESP32 receivers running the preserved
-Espressif CSI projects, USB serial connections, and a Linux USB/UVC camera.
+Espressif CSI projects, USB serial connections, and either a Linux USB/UVC camera or a phone browser camera.
 
 ```bash
 make down
@@ -68,7 +68,9 @@ for the preserved commit, SDK configs, targets and hashes.
 
 ### Identify and flash boards
 
-Refresh Hardware Setup after reconnecting USB devices. Stable `/dev/serial/by-id`
+Refresh Hardware Setup after reconnecting USB devices. Discovery only includes
+`/dev/ttyUSB0`–`/dev/ttyUSB9` and `/dev/ttyACM0`–`/dev/ttyACM9`; `/dev/ttyS*`
+is excluded. This filters the application list; it does not remove Linux device nodes. Stable `/dev/serial/by-id`
 paths and USB identities preserve assignments across tty renumbering. Devices
 without unique USB serials fall back to stable paths, USB location, then tty path;
 verify these assignments again after moving USB sockets.
@@ -112,6 +114,67 @@ If serial/camera access fails, close other serial monitors or camera apps,
 check cable/data support and `/dev` visibility, and inspect hardware job logs.
 No operation silently substitutes synthetic input for failing physical hardware.
 
+## Use a phone as the recording camera
+
+No domain is required. In `.env`, set `PHONE_HOST` to an IPv4 address or hostname
+that the phone can reach and resolve, without `https://` or a port:
+
+```dotenv
+PHONE_HOST=192.168.1.50
+PHONE_HTTPS_PORT=8443
+PHONE_CERT_PORT=8081
+```
+
+A reachable public IPv4 address also works. Routing/firewall access to these ports
+must be available from the phone. A hostname must already resolve on that network;
+this setting does not register a domain or configure DNS.
+
+Start the normal or mock stack first, then:
+
+```bash
+make phone-cert           # build frontend and generate certificates in Docker
+make phone                # enable phone ports; preserve current hardware mode
+# Add DOCKER='sudo docker' if needed.
+```
+
+1. On the phone, download `http://YOUR_PHONE_HOST:8081/phone-ca.crt`. Install the
+   lab CA certificate as trusted, using the phone's certificate settings. On iOS,
+   also enable full trust under **Settings → General → About → Certificate Trust
+   Settings**. The certificate must be trusted by the browser. A warning bypass
+   alone may not enable camera capture; [browser camera access requires a secure
+   context](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia).
+2. On the computer at `http://localhost:8080`, open **Hardware Setup → Connect a
+   phone camera**. The address comes from `.env`; choose a name and capture preset,
+   then **Create phone pairing link**. Copy the link to the phone.
+3. On the phone, open that link, tap **Start phone camera**, and allow camera access.
+   The live view and delivered-frame counter show the upload is running. No audio
+   is requested or recorded.
+4. On the computer, **Refresh connected cameras**, select the phone in **Capture
+   device**, and run preflight/recording as usual. The paired resolution and FPS
+   apply automatically. Close a computer preview before preflight or recording.
+5. Keep the phone page visible and the phone awake throughout recording. Stop the
+   recording on the computer before stopping the phone camera. A disconnect or
+   upload stall during acquisition makes the session incomplete and preserves
+   collected artifacts. Reconnecting requires a new pairing link.
+
+The phone listener exposes only the phone page, certificate, and token-protected
+camera upload. Pair creation, device operations, recording controls, and session
+files remain on the localhost administration listener. Pairing links expire after
+10 minutes and can be used once. Only share the link with the intended camera;
+only `ca.crt` is for download, never the private keys in `PHONE_TLS_PATH`.
+
+Phone frames are JPEG uploads, encoded to the same H.264 session video as USB
+frames. Frames use collector-side WebSocket receipt timestamps in the CSI host
+clock. Phone `performance.now()` timestamps remain separate, **unaligned** values.
+JPEG encoding and network delay remain unmeasured; this provides synchronization
+by arrival time, not phone sensor exposure time. One outstanding frame and bounded
+collector queues limit buffering. Skipped upload intervals and queue drops are
+counted and can mark a recording degraded. Actual FPS must pass preflight.
+
+Change `PHONE_HOST` and rerun `make phone-cert` and `make phone` when the address
+changes. The existing CA is reused. `make phone-off` removes the extra listeners.
+After a later `make up` or `make mock`, rerun `make phone` to enable them again.
+
 ## Recording and synchronization
 
 Preflight verifies all selected devices, identity consistency, actual parsable
@@ -122,9 +185,10 @@ verified indirectly through received CSI packets, not by opening its serial port
 
 All devices and outputs initialize before a shared acquisition gate opens.
 CSI packets and camera frames receive **`time.monotonic_ns()`** timestamps in the
-same service process immediately after complete line receipt / camera read.
+same service process immediately after complete line receipt / camera read /
+phone WebSocket frame receipt.
 ESP local timestamps are microseconds (uint32, wrapping); UTC time is only descriptive. Serial queues, compression, video encoding, and HTTP
-requests do not define acquisition timestamps.
+requests do not define serial or USB camera acquisition timestamps.
 
 Use `tx_seq` to align receivers. Each raw row also preserves ESP local timestamp,
 original `id`/`seq`, MAC, RSSI, all emitted PHY fields, gain context when emitted,
@@ -153,6 +217,12 @@ sequence resets is `degraded`. Hardware/encoder errors, no CSI or no video, and
 finalization failures mark it `incomplete`. A data stall or low disk space stops
 recording. No recording is overwritten or automatically deleted.
 
+To explicitly delete a saved session, open **Sessions → Remove** and type its exact
+session ID. This permanently removes its CSI, video, frame timestamps, metadata,
+and collection logs, then refreshes the archive and manifest. Active recordings
+and sessions with running acquisition threads cannot be removed. Removal is a
+tracked job and cannot be cancelled after it starts.
+
 ## Data layout
 
 ```text
@@ -169,13 +239,17 @@ data/
       csi_rx_left.csv.zst           # streaming compressed raw CSV
       csi_rx_right.csv.zst
       video.mp4                    # fragmented H.264 MP4
-      video_frames.parquet         # frame index, PTS/time base, host/UTC time
+      video_frames.parquet         # schema 1.1: frame index, PTS, host/UTC, phone times
     logs/
       collection.log
       serial_rx_left.jsonl         # boot/gain lines and rejected records
       serial_rx_right.jsonl
       <failing-thread>.log         # traceback when an operation fails
 ```
+
+New video frame indexes use schema `1.1`, adding nullable `phone_frame_idx`,
+`phone_capture_timestamp_ms`, and `phone_skipped_frames_total` columns. USB frames
+leave these null. Existing schema `1.0` recordings are readable and unchanged.
 
 All collection settings are copied into session metadata, including experiment
 notes, optional hardware geometry, receiver firmware provenance when flashed by
@@ -216,7 +290,8 @@ Tests use temporary directories. They verify both CSI formats, signed uint32
 conversion, sequence wraps/gaps, configuration validation, synchronized multi-RX
 recording, exact decoded video PTS/frame index agreement, manual stop, raw-file
 immutability, hardware contention, camera/encoder failure, queue overflow, and
-restart recovery.
+restart recovery, phone pairing/expiry, JPEG validation, phone timing, and safe
+session removal.
 
 The browser test uses Google Chrome with H.264 support in a disposable Docker image.
 It drives board assignment, camera/CSI tests, preflight, manual
@@ -225,6 +300,10 @@ record/stop, and session playback/downloads against the full mock Compose stack:
 ```bash
 make mock
 make test-ui
+# Also run phone pairing, recording, and removal in Chrome with a simulated camera:
+make phone-cert PHONE_HOST=127.0.0.1
+make phone
+make test-ui PHONE_BASE_URL=https://127.0.0.1:8443
 ```
 
 Opt-in read-only device tests live under `tests/hardware`; they never automatically

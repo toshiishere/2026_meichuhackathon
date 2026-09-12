@@ -1,6 +1,7 @@
 import glob
 import math
 import random
+import re
 import time
 from pathlib import Path
 import cv2
@@ -9,6 +10,7 @@ import serial
 from serial.tools import list_ports
 from apps.common.config import MODE, DEFAULTS
 from .csi import LEGACY
+from .phone import hub, PhoneCameraSource
 
 
 def serial_devices():
@@ -32,7 +34,11 @@ def serial_devices():
     stable = {}
     for p in sorted(Path("/dev/serial/by-id").glob("*")):
         stable.setdefault(str(p.resolve()), str(p))
-    ports = list(list_ports.comports())
+    ports = [
+        p
+        for p in list_ports.comports()
+        if re.fullmatch(r"/dev/tty(?:USB|ACM)[0-9]", p.device)
+    ]
     serial_counts = {}
     for p in ports:
         if p.serial_number:
@@ -88,7 +94,7 @@ def cameras():
                 name="Synthetic timing camera",
                 formats="Generated frames; requested size and FPS",
             )
-        ]
+        ] + hub.discover()
     result = []
     import subprocess
 
@@ -111,7 +117,7 @@ def cameras():
                 formats=details,
             )
         )
-    return result
+    return result + hub.discover()
 
 
 class SerialSource:
@@ -185,9 +191,10 @@ class SerialSource:
                 )
                 + ']"'
             )
-            return ",".join(
-                str(values[k]) for k in LEGACY
-            ).encode(), time.monotonic_ns()
+            return (
+                ",".join(str(values[k]) for k in LEGACY).encode(),
+                time.monotonic_ns(),
+            )
         chunk = self.handle.read_until(b"\n", size=DEFAULTS["max_serial_line_bytes"])
         timestamp = time.monotonic_ns()
         if not chunk:
@@ -214,6 +221,11 @@ class SerialSource:
 
 
 class CameraSource:
+    def __new__(cls, config):
+        if config.device.startswith("phone://"):
+            return PhoneCameraSource(config)
+        return super().__new__(cls)
+
     def __init__(self, config):
         self.config = config
         self.synthetic = MODE == "synthetic"

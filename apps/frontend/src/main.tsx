@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
+import { PhoneCamera, PhoneSetup } from "./PhoneCamera";
+import { RemoveSessionDialog } from "./RemoveSessionDialog";
 
 type Json = Record<string, any>;
 type Board = {
@@ -108,6 +110,7 @@ function Empty({ children }: { children: React.ReactNode }) {
 }
 
 function App() {
+  const [removeSessionId, setRemoveSessionId] = useState<string | null>(null);
   const [page, setPage] = useState("Dashboard");
   const [health, setHealth] = useState<Json>({});
   const defaultsLoaded = React.useRef(false);
@@ -138,7 +141,28 @@ function App() {
     geometry: "",
   });
   const [preview, setPreview] = useState("");
-  const previewToken = React.useRef(crypto.randomUUID());
+  function generateUUID() {
+    if (typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0"));
+
+    return [
+      hex.slice(0, 4).join(""),
+      hex.slice(4, 6).join(""),
+      hex.slice(6, 8).join(""),
+      hex.slice(8, 10).join(""),
+      hex.slice(10, 16).join(""),
+    ].join("-");
+  }
+  const previewToken = React.useRef(generateUUID());
   const closePreview = () => {
     setPreview("");
     api("/hardware/camera/close", { token: previewToken.current }).catch((e) =>
@@ -208,11 +232,20 @@ function App() {
     if (!defaultsLoaded.current && h.hardware?.defaults) {
       const d = h.hardware.defaults;
       defaultsLoaded.current = true;
-      setForm((old) => ({...old, baud_rate: d.baud_rate,
-        expected_rate_hz: d.expected_rate_hz, min_rate_ratio: d.min_rate_ratio,
-        synthetic_loss: d.synthetic_loss, synthetic_seed: d.synthetic_seed}));
-      setCamera((old) => ({...old, width: d.camera_width,
-        height: d.camera_height, fps: d.camera_fps}));
+      setForm((old) => ({
+        ...old,
+        baud_rate: d.baud_rate,
+        expected_rate_hz: d.expected_rate_hz,
+        min_rate_ratio: d.min_rate_ratio,
+        synthetic_loss: d.synthetic_loss,
+        synthetic_seed: d.synthetic_seed,
+      }));
+      setCamera((old) => ({
+        ...old,
+        width: d.camera_width,
+        height: d.camera_height,
+        fps: d.camera_fps,
+      }));
     }
     setSelectedPort((old) => old || p[0]?.port || "");
     setCamera((old) => ({ ...old, device: old.device || c[0]?.device || "" }));
@@ -327,6 +360,29 @@ function App() {
     setDetail(await api(`/sessions/${sid}`));
     choosePage("Sessions");
   };
+  const selectCamera = (device: string) => {
+    const selected = cameras.find((c) => c.device === device);
+    closePreview();
+    setCamera((old) => ({
+      ...old,
+      device,
+      ...(device.startsWith("phone://") && selected
+        ? { width: selected.width, height: selected.height, fps: selected.fps }
+        : {}),
+    }));
+    setPreflight(null);
+  };
+  useEffect(() => {
+    if (
+      currentJob?.kind === "session-remove" &&
+      currentJob.status === "completed"
+    ) {
+      setDetail((old) =>
+        old?.session_id === currentJob.result.session_id ? null : old,
+      );
+      run(refresh);
+    }
+  }, [currentJob?.id, currentJob?.status]);
   const cameraQuery = `token=${previewToken.current}&device=${encodeURIComponent(camera.device)}&width=${camera.width}&height=${camera.height}&fps=${camera.fps}`;
   const changeForm = (key: string, value: string | number) => {
     setForm((old) => ({ ...old, [key]: value }));
@@ -335,6 +391,22 @@ function App() {
 
   return (
     <div className="shell">
+      {removeSessionId && (
+        <RemoveSessionDialog
+          sessionId={removeSessionId}
+          busy={busy}
+          error={error}
+          onCancel={() => setRemoveSessionId(null)}
+          onRemove={() =>
+            run(async () => {
+              await submitJob(`/sessions/${removeSessionId}/remove`, {
+                confirm_session_id: removeSessionId,
+              });
+              setRemoveSessionId(null);
+            })
+          }
+        />
+      )}
       <aside>
         <a
           className="brand"
@@ -805,10 +877,14 @@ function App() {
                   </p>
                 </section>
               </div>
+              <PhoneSetup
+                phoneOrigin={health.phone_origin}
+                onConnected={() => run(refresh)}
+              />
               <section className="panel">
                 <div className="panel-heading">
                   <h2>Camera setup</h2>
-                  <span className="subtle">USB / UVC capture</span>
+                  <span className="subtle">USB / UVC / phone capture</span>
                 </div>
                 <div className="two-column">
                   <div>
@@ -817,7 +893,7 @@ function App() {
                         value={camera.device}
                         onChange={(e) => {
                           closePreview();
-                          setCamera({ ...camera, device: e.target.value });
+                          selectCamera(e.target.value);
                         }}
                       >
                         {!cameras.length && (
@@ -839,6 +915,7 @@ function App() {
                           <input
                             type="number"
                             min="1"
+                            disabled={camera.device.startsWith("phone://")}
                             value={camera[key]}
                             onChange={(e) => {
                               closePreview();
@@ -1035,7 +1112,7 @@ function App() {
                       <select
                         value={camera.device}
                         onChange={(e) => {
-                          setCamera({ ...camera, device: e.target.value });
+                          selectCamera(e.target.value);
                           setPreflight(null);
                         }}
                       >
@@ -1209,6 +1286,10 @@ function App() {
                 <SessionTable
                   sessions={sessions}
                   inspect={(sid) => run(() => inspectSession(sid))}
+                  remove={(id) => {
+                    setError("");
+                    setRemoveSessionId(id);
+                  }}
                 />
               </section>
               {detail && (
@@ -1329,7 +1410,7 @@ function App() {
                 </h2>
                 <div className="actions">
                   {["running", "queued"].includes(currentJob.status) &&
-                    currentJob.kind !== "flash" && (
+                    !["flash", "session-remove"].includes(currentJob.kind) && (
                       <button
                         onClick={() =>
                           run(() => api(`/jobs/${currentJob.id}/cancel`, {}))
@@ -1435,9 +1516,11 @@ function Preflight({ result }: { result: Json }) {
 function SessionTable({
   sessions,
   inspect,
+  remove,
 }: {
   sessions: Json[];
   inspect: (sid: string) => void;
+  remove?: (sid: string) => void;
 }) {
   return !sessions.length ? (
     <Empty>
@@ -1454,6 +1537,7 @@ function SessionTable({
             <th>Receivers</th>
             <th>Quality</th>
             <th>Status</th>
+            {remove && <th>Actions</th>}
           </tr>
         </thead>
         <tbody>
@@ -1482,6 +1566,20 @@ function SessionTable({
               <td>
                 <Badge value={s.status} />
               </td>
+              {remove && (
+                <td>
+                  <button
+                    className="danger"
+                    disabled={["starting", "recording", "stopping"].includes(
+                      s.status,
+                    )}
+                    onClick={() => remove(s.session_id)}
+                    aria-label={`Remove session ${s.session_id}`}
+                  >
+                    Remove
+                  </button>
+                </td>
+              )}
             </tr>
           ))}
         </tbody>
@@ -1553,7 +1651,15 @@ function LiveStatus({ status }: { status: Json }) {
             />
             <Metric
               label="Camera queue drops"
-              value={status.camera?.queue_drops || 0}
+              value={
+                (status.camera?.queue_drops || 0) +
+                (status.camera?.phone_queue_drops || 0)
+              }
+              sub={
+                status.camera?.phone_skipped_frames !== undefined
+                  ? `${status.camera.phone_skipped_frames} phone upload intervals skipped`
+                  : undefined
+              }
             />
           </div>
         </>
@@ -1562,4 +1668,6 @@ function LiveStatus({ status }: { status: Json }) {
   );
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(document.getElementById("root")!).render(
+  location.pathname === "/phone" ? <PhoneCamera /> : <App />,
+);

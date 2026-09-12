@@ -116,6 +116,10 @@ class Registry:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def delete(self, kind, key):
+        with self.connect() as db:
+            db.execute("DELETE FROM records WHERE kind=? AND id=?", (kind, key))
+
     def list(self, kind):
         with self.connect() as db:
             rows = db.execute(

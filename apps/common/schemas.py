@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .config import DEFAULTS
 
 ID = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$"
-PORT = r"^(?:/dev/tty(?:USB|ACM)[0-9]+|/dev/serial/by-id/[A-Za-z0-9_.:+-]+|synthetic://(?:tx|rx[0-9]+))$"
+PORT = r"^(?:/dev/tty(?:USB|ACM)[0-9]|/dev/serial/by-id/[A-Za-z0-9_.:+-]+|synthetic://(?:tx|rx[0-9]+))$"
 TARGETS = Literal["esp32", "esp32s3", "esp32c3", "esp32c6"]
 
 
@@ -32,7 +32,7 @@ class Receiver(Strict):
 class CameraConfig(Strict):
     device: str = Field(
         default="synthetic://camera",
-        pattern=r"^(?:/dev/video[0-9]+|synthetic://camera)$",
+        pattern=r"^(?:/dev/video[0-9]+|phone://[a-f0-9]{32}|synthetic://camera)$",
     )
     fps: int = Field(default=DEFAULTS["camera_fps"], ge=1, le=120)
     width: int = Field(default=DEFAULTS["camera_width"], ge=160, le=3840)
@@ -90,3 +90,14 @@ class FlashRequest(Strict):
     gpio: int | None = Field(default=None, ge=0, le=48)
     led_type: Literal["gpio", "rgb", "none"] = "gpio"
     active_low: bool = False
+
+
+class PhonePairRequest(Strict):
+    name: str = Field(default="Phone camera", min_length=1, max_length=80)
+    width: int = Field(default=640, ge=160, le=1920, multiple_of=2)
+    height: int = Field(default=480, ge=120, le=1080, multiple_of=2)
+    fps: int = Field(default=15, ge=1, le=30)
+
+
+class RemoveSessionRequest(Strict):
+    confirm_session_id: str = Field(pattern=ID)

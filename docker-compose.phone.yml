@@ -1,0 +1,16 @@
+services:
+  frontend:
+    ports:
+      - '${PHONE_BIND_IP:-0.0.0.0}:${PHONE_HTTPS_PORT:-8443}:443'
+      - '${PHONE_BIND_IP:-0.0.0.0}:${PHONE_CERT_PORT:-8081}:81'
+    volumes:
+      - ./docker/nginx-phone.conf:/etc/nginx/conf.d/phone.conf:ro
+      - ${PHONE_TLS_PATH:-./data/app/phone_tls}:/etc/nginx/phone-tls:ro
+  phone-cert:
+    image: ${COMPOSE_PROJECT_NAME:-csi-collection}-frontend
+    profiles: ['tools']
+    entrypoint: ['/usr/local/bin/setup-phone-tls']
+    environment:
+      PHONE_HOST: ${PHONE_HOST:-}
+    volumes:
+      - ${PHONE_TLS_PATH:-./data/app/phone_tls}:/certs

@@ -7,7 +7,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from apps.common.config import DATA
-from apps.common.schemas import Device, ID
+from apps.common.schemas import Device, ID, RemoveSessionRequest
 from apps.common.storage import Registry, scan_sessions, read_session, rebuild_manifest
 
 HARDWARE = os.getenv("HARDWARE_URL", "http://hardware-service:8001")
@@ -68,7 +68,13 @@ async def hardware(method, path, **kwargs):
 @app.get("/api/health")
 async def health():
     info = (await hardware("GET", "/health")).json()
-    return {"status": "ok", "hardware": info}
+    host = os.getenv("PHONE_HOST", "")
+    port = os.getenv("PHONE_HTTPS_PORT", "8443")
+    return {
+        "status": "ok",
+        "hardware": info,
+        "phone_origin": f"https://{host}:{port}" if host else None,
+    }
 
 
 @app.get("/api/devices")
@@ -106,6 +112,10 @@ async def save_device(device: Device):
 @app.get("/api/sessions")
 def sessions():
     values = scan_sessions(DATA)
+    existing = {s["session_id"] for s in values}
+    for old in registry.list("sessions"):
+        if old["session_id"] not in existing:
+            registry.delete("sessions", old["session_id"])
     for s in values:
         registry.put(
             "sessions",
@@ -162,6 +172,7 @@ ROUTES = {
     ("POST", "camera/test"): "/camera/test",
     ("POST", "camera/close"): "/camera/close",
     ("POST", "flash"): "/flash",
+    ("POST", "phone/pair"): "/phone/pair",
 }
 
 
@@ -276,3 +287,12 @@ async def events(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/sessions/{sid}/remove")
+async def remove_session(sid: str, body: RemoveSessionRequest):
+    if not re.fullmatch(ID, sid) or body.confirm_session_id != sid:
+        raise HTTPException(400, "Type the exact session ID to confirm removal")
+    return (
+        await hardware("POST", f"/sessions/{sid}/remove", json=body.model_dump())
+    ).json()

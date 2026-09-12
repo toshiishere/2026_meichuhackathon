@@ -22,6 +22,8 @@ services:
     environment:
       DATA_DIR: /data
       HARDWARE_URL: http://hardware-service:8001
+      PHONE_HOST: ${PHONE_HOST:-}
+      PHONE_HTTPS_PORT: ${PHONE_HTTPS_PORT:-8443}
     volumes:
       - ${DATA_PATH:-./data}:/data
     depends_on:

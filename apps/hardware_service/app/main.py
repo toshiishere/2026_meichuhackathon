@@ -1,9 +1,13 @@
 import asyncio
 import json
+import re
+import shutil
 import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
 import cv2
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, Response
 from apps.common.config import DATA, MODE, DEFAULTS
 from apps.common.schemas import (
@@ -11,6 +15,9 @@ from apps.common.schemas import (
     SerialRequest,
     CameraConfig,
     FlashRequest,
+    PhonePairRequest,
+    RemoveSessionRequest,
+    ID,
 )
 from apps.common.storage import scan_sessions, atomic_json, rebuild_manifest
 from .sources import serial_devices, cameras, CameraSource
@@ -18,6 +25,7 @@ from .checks import serial_test, camera_test, preflight
 from .jobs import Jobs, BusyError
 from .firmware import probe, flash
 from .recorder import Recorder
+from .phone import hub
 
 jobs = None
 recorder = None
@@ -216,12 +224,7 @@ def start(body: CollectionConfig):
         )
 
     def work(log, stop):
-        global \
-            recorder, \
-            collection_stop, \
-            collection_pending, \
-            collection_error, \
-            preflight_status
+        global recorder, collection_stop, collection_pending, collection_error, preflight_status
         collection_stop = stop
         collection_pending = True
         collection_error = None
@@ -293,3 +296,99 @@ def logs(jid: str):
 def cancel(jid: str):
     get_job(jid)
     return jobs.cancel(jid)
+
+
+@app.post("/phone/pair")
+def pair_phone(body: PhonePairRequest):
+    return hub.pair(body.model_dump())
+
+
+@app.websocket("/phone/stream")
+async def phone_stream(socket: WebSocket):
+    # The LAN proxy exposes only this token-authenticated upload endpoint.
+    await socket.accept()
+    pid, connected = None, False
+    try:
+        auth = await asyncio.wait_for(socket.receive_json(), timeout=15)
+        if not isinstance(auth, dict) or not isinstance(auth.get("id"), str):
+            raise ValueError("Invalid phone handshake")
+        pid = auth["id"]
+        settings = hub.settings(pid, auth.get("token"))
+        await socket.send_json({"type": "settings", **settings})
+        ready = await asyncio.wait_for(socket.receive_json(), timeout=120)
+        if not isinstance(ready, dict) or ready.get("type") != "ready":
+            raise ValueError("Expected phone camera readiness")
+        hub.connect(pid, auth.get("token"), ready.get("native_resolution"))
+        connected = True
+        await socket.send_json({"type": "ready", "device": f"phone://{pid}"})
+        while True:
+            payload = await asyncio.wait_for(socket.receive_bytes(), timeout=10)
+            stamp = time.monotonic_ns()
+            result = await asyncio.to_thread(hub.accept_frame, pid, payload, stamp)
+            await socket.send_json(result)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await socket.send_json(
+                {
+                    "type": "error",
+                    "message": str(e) or "Phone stopped responding; pair again",
+                }
+            )
+            await socket.close(code=1008)
+        except Exception:
+            pass
+    finally:
+        if connected:
+            hub.disconnect(pid)
+
+
+@app.post("/sessions/{sid}/remove")
+def remove_session(sid: str, body: RemoveSessionRequest):
+    if not re.fullmatch(ID, sid) or body.confirm_session_id != sid:
+        raise HTTPException(400, "Type the exact session ID to confirm removal")
+    path = DATA / "sessions" / sid
+    if (
+        not path.is_dir()
+        or path.is_symlink()
+        or path.resolve().parent != (DATA / "sessions").resolve()
+    ):
+        raise HTTPException(404, "Session not found")
+
+    def work(log, stop):
+        if (
+            recorder
+            and recorder.config.session_id == sid
+            and (
+                recorder.state not in {"complete", "incomplete"}
+                or any(t.is_alive() for t in recorder.threads)
+            )
+        ):
+            raise RuntimeError(
+                "Cannot remove a recording or a session with active acquisition threads"
+            )
+        metadata_path = path / "metadata.json"
+        if metadata_path.exists():
+            try:
+                state = json.loads(metadata_path.read_text()).get("status")
+            except ValueError:
+                state = "unreadable"
+            if state in {"starting", "recording", "stopping"}:
+                raise RuntimeError(
+                    "Cannot remove a recording session; stop it or restart the collector to recover it first"
+                )
+        # First remove the whole directory from the archive atomically. If disk
+        # cleanup fails, the partial directory stays outside the canonical archive.
+        trash = DATA / "app/removing_sessions"
+        trash.mkdir(parents=True, exist_ok=True)
+        target = trash / f"{sid}_{uuid.uuid4().hex}"
+        path.rename(target)
+        log(f"Removing session {sid}: raw CSI, video, timestamps, metadata and logs")
+        try:
+            shutil.rmtree(target)
+        finally:
+            rebuild_manifest(DATA)
+        return {"session_id": sid, "removed": True}
+
+    return jobs.submit("session-remove", work)

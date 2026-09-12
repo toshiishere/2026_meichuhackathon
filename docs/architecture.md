@@ -36,3 +36,28 @@ upstream examples. Vendored project copies retain SDK configs, dependency locks,
 100 Hz, channel 11, HT40 and RX 921600 baud. Original tree and boards are untouched.
 Firmware cache keys include source content, original upstream commit, target,
 IDF version and blink configuration. Builds use private copies of the projects.
+
+Phone cameras connect through an optional nginx TLS listener, which serves only
+`/phone`, static assets, the lab CA certificate, and `/api/phone/stream`. Phone
+pairing is created through the local administration API. The upload WebSocket goes
+directly to the hardware service; the backend does not forward acquisition frames.
+The hardware service checks one-use expiring credentials, timestamps each complete
+message before JPEG decoding, acknowledges one frame at a time, and delivers decoded
+frames through bounded per-camera subscriber queues. The regular camera interface
+supports preview, preflight, recording, and disconnect/stall failure handling.
+
+Phone sequence and `performance.now()` capture times are retained as nullable frame
+index schema 1.1 columns. They never replace the shared host clock. Native phone
+resolution is shown in discovery; the browser scales with letterboxing to the paired
+output size. Network/JPEG delay is unmeasured, and client skips and queue drops are
+reported. No clock-offset correction or synthetic frame interpolation is applied.
+
+Serial discovery filters actual tty nodes to `/dev/ttyUSB[0-9]` and
+`/dev/ttyACM[0-9]`, retaining available stable by-id aliases. Validation checks the
+current discovered set before hardware operations.
+
+Explicit session removal takes the exclusive hardware lease, rejects active
+recordings, atomically moves the directory out of the archive into
+`app/removing_sessions`, then deletes it and rebuilds the manifest. If cleanup
+fails, remaining files stay there for manual recovery and the job records failure.
+The backend prunes removed session index entries when the archive is refreshed.
