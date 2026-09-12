@@ -1,0 +1,12 @@
+.env
+data/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+node_modules/
+dist/
+playwright-report/
+test-results/
+firmware/**/build/
+firmware/**/managed_components/

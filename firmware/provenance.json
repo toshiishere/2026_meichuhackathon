@@ -1,0 +1,42 @@
+{
+  "esp_csi_git_commit": "8633d67152db2808f141cc1595970aa9cf406045",
+  "esp_idf_version": "5.5.0",
+  "source": "/home/toshi/esp-csi",
+  "source_files_sha256": {
+    "blink_identify/sdkconfig": "e0a96c17532434cdb9bb80ec6519a19949b3144b1d336c18f2c3b52fb1e2f594",
+    "blink_identify/CMakeLists.txt": "4f2a063898ebcb93aed5ee553014c5c631d20e72e79f7e871620f45d9f3a03ff",
+    "blink_identify/sdkconfig.defaults": "e3467b59d4e653a969acd21c6d173cfc595119a5b08769fb5a099607b1610d8f",
+    "blink_identify/dependencies.lock": "aa24f163f94fe486cc95c7cf72145a836a6364e9317e90682e50cff657d3ac24",
+    "blink_identify/README.md": "8b2f9b87192227b5864b9f0eed0d44292e1ffcb0c949b281e50faf8ac6caa02b",
+    "esp-csi/csi_send/sdkconfig": "747492f7c75b6a071417edd56879db97fb4a5e0cfed1c87fde6cfbb170077556",
+    "esp-csi/csi_send/CMakeLists.txt": "3b40c0f4490a691d92779c933ed2cb47ac2b5b6716d52b38f41de1af36f50f3e",
+    "esp-csi/csi_send/sdkconfig.defaults": "0f75cb5a58663e3a3ada3108b57f31b2ad94ab14f8be0f21abb4cb3f98691564",
+    "esp-csi/csi_send/dependencies.lock": "b34aa81a3870dbbd93f0deff5f5b64a790e315378a4631728621a77df48a1708",
+    "esp-csi/csi_send/README.md": "d04b4e089862c582b03f58633713eff1f6a85c1aef1d66b2c27192f6ff5f98b4",
+    "esp-csi/csi_recv/sdkconfig": "88bd15bd0c8b1063611f7b4b1b2dd12dce86be5a698f56930950a8b3fde67385",
+    "esp-csi/csi_recv/CMakeLists.txt": "b2b2ac08afe100f65a4b6f7a230c556eb5a5e87f26867d477412e7a9be215ff7",
+    "esp-csi/csi_recv/sdkconfig.defaults": "a2eb9b9f20b99aa3edd4ac4f4657a4ae7beef1fcb451cc3f90e8621cbf3e3d7e",
+    "esp-csi/csi_recv/dependencies.lock": "e6de8d1c98541f21bfb1a4d57ce4c00caa34ce72e099ab4fbfd042e3de5c5f96",
+    "esp-csi/csi_recv/README.md": "1c23c00059d83cc2d601eb6dd14517f1126c3d0421c79c11c746becfd57b24cb",
+    "esp-csi/csi_send/main/CMakeLists.txt": "47114157940dc826fa2b7f81beeb00d95b0249d410ea516565916871a4247846",
+    "esp-csi/csi_send/main/idf_component.yml": "7a5da6afff34a73cffec4fc8b8f85c1c0e9da977e4ec7e3af07ac190e2e45fde",
+    "esp-csi/csi_send/main/app_main.c": "c7272390dad84e046d01cf21ac08179c04f02f59a28fc6d1b7eaf3d04960c5ba",
+    "esp-csi/csi_recv/main/CMakeLists.txt": "47114157940dc826fa2b7f81beeb00d95b0249d410ea516565916871a4247846",
+    "esp-csi/csi_recv/main/idf_component.yml": "2ddc99de419c32e0ab504e0c34bed39c84daf70c08ea351cb2b00a15ae833720",
+    "esp-csi/csi_recv/main/app_main.c": "d13aa1357eed41ed6b57293683ae5dcd7572f37ca3cc729125ec8caf68047389",
+    "blink_identify/main/CMakeLists.txt": "6db8eb3c1097e875c7331d40db20453c84d50350f94224afd8ad353f006421ef",
+    "blink_identify/main/idf_component.yml": "4b046a1e750d55126fa3ee16bb0de8d0c4eb6ae4e92d19bc580f226c0697648a",
+    "blink_identify/main/Kconfig.projbuild": "0a0f22cec36e24cd821f885d4a22f925d1568733922330bc0f11c0556177d888",
+    "blink_identify/main/app_main.c": "317cc8c34642d1583069bcb7114ff5494e7d79a62dc0edc287cdf0e94206674e"
+  },
+  "working_targets": {
+    "csi_send": "esp32",
+    "csi_recv": "esp32c3"
+  },
+  "wifi": {
+    "channel": 11,
+    "bandwidth": "HT40",
+    "expected_packet_rate_hz": 100
+  },
+  "receiver_baud_rate": 921600
+}

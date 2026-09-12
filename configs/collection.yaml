@@ -1,0 +1,16 @@
+schema_version: '1.0'
+baud_rate: 921600
+expected_rate_hz: 100
+min_rate_ratio: 0.7
+camera_fps: 30
+camera_width: 1280
+camera_height: 720
+preflight_seconds: 3
+minimum_free_bytes: 1073741824
+serial_queue_size: 4096
+camera_queue_size: 90
+serial_timeout_seconds: 0.2
+stall_timeout_seconds: 5
+max_serial_line_bytes: 32768
+synthetic_loss: 0.01
+synthetic_seed: 42

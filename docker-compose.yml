@@ -1,0 +1,54 @@
+name: csi-collection
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - '127.0.0.1:${WEB_PORT:-8080}:80'
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    environment:
+      DATA_DIR: /data
+      HARDWARE_URL: http://hardware-service:8001
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+    depends_on:
+      hardware-service:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8000/api/health")']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  hardware-service:
+    build:
+      context: .
+      dockerfile: docker/hardware.Dockerfile
+    environment:
+      DATA_DIR: /data
+      HARDWARE_MODE: real
+      PROJECT_GIT_COMMIT: ${PROJECT_GIT_COMMIT:-unknown}
+    privileged: true
+    volumes:
+      - /dev:/dev
+      - ${DATA_PATH:-./data}:/data
+    stop_grace_period: 60s
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8001/health")']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped

@@ -1,0 +1,39 @@
+menu "Blink Configuration"
+
+    choice BLINK_LED_TYPE
+        prompt "LED type"
+        default BLINK_LED_GPIO
+
+        config BLINK_LED_GPIO
+            bool "Simple GPIO LED"
+
+        config BLINK_LED_RGB
+            bool "Addressable WS2812 RGB LED"
+            depends on SOC_RMT_SUPPORTED
+    endchoice
+
+    config BLINK_GPIO
+        int "LED GPIO number"
+        range 0 SOC_GPIO_OUT_RANGE_MAX
+        default 8 if IDF_TARGET_ESP32C3
+        default 2
+        help
+            Choose the LED pin from your board's pinout or schematic.
+            GPIO2 (ESP32) and GPIO8 (ESP32-C3) are starting defaults;
+            the LED wiring depends on the board, not just the chip.
+            Do not select a pin connected to flash or another peripheral.
+
+    config BLINK_ACTIVE_LOW
+        bool "LED is active low (low output turns it on)"
+        depends on BLINK_LED_GPIO
+        default n
+
+    config BLINK_INTERVAL_MS
+        int "Time between LED toggles (milliseconds)"
+        range 100 60000
+        default 500
+        help
+            With 500 ms, the LED is on for half a second and off for
+            half a second, giving one complete blink per second.
+
+endmenu

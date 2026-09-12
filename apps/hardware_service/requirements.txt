@@ -1,0 +1,6 @@
+-r ../common/requirements.txt
+pyserial==3.5
+zstandard==0.23.0
+numpy==2.2.5
+opencv-python-headless==4.11.0.86
+av==16.0.1

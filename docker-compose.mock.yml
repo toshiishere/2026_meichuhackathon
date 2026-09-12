@@ -1,0 +1,9 @@
+services:
+  hardware-service:
+    build:
+      dockerfile: docker/hardware-mock.Dockerfile
+    environment:
+      HARDWARE_MODE: synthetic
+    privileged: false
+    volumes: !override
+      - ${DATA_PATH:-./data}:/data
