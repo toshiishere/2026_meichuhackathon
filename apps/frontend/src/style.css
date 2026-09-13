@@ -916,6 +916,20 @@ footer {
 .pair-link input {
   font-family: ui-monospace, monospace;
 }
+
+.pair-qr {
+  margin: 0 0 18px;
+}
+.pair-qr svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  background: white;
+}
+.pair-qr figcaption {
+  margin-top: 8px;
+  font-size: 13px;
+}
 .remove-dialog {
   max-width: 520px;
   width: calc(100% - 32px);

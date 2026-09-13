@@ -155,8 +155,15 @@ make phone                # enable phone ports; preserve current hardware mode
    context](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia).
 2. On the computer at `http://localhost:8080`, open **Hardware Setup → Connect a
    phone camera**. The address comes from `.env`; choose a name and capture preset,
-   then **Create phone pairing link**. Copy the link to the phone.
-3. On the phone, open that link, tap **Start phone camera**, and allow camera access.
+   then **Create phone pairing link**. Scan the displayed QR code with the phone
+   or copy the link. The QR code is generated locally, including the one-use token.
+3. On the phone, tap **Choose camera / preview**, allow camera access, and select
+   a lens from **Camera**. Automatic selection prefers an identified rear ultra-wide
+   lens, then wide-angle, and falls back to the default rear camera. Available lenses
+   depend on what the browser exposes; [camera enumeration requires permission](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/enumerateDevices).
+   Previewing and switching lenses do not consume the pairing link. Choose the lens
+   before streaming, then tap **Start phone camera**. You can also start directly
+   with automatic selection.
    The live view and delivered-frame counter show the upload is running. No audio
    is requested or recorded.
 4. On the computer, **Refresh connected cameras**, select the phone in **Capture
@@ -177,9 +184,19 @@ Phone frames are JPEG uploads, encoded to the same H.264 session video as USB
 frames. Frames use collector-side WebSocket receipt timestamps in the CSI host
 clock. Phone `performance.now()` timestamps remain separate, **unaligned** values.
 JPEG encoding and network delay remain unmeasured; this provides synchronization
-by arrival time, not phone sensor exposure time. One outstanding frame and bounded
-collector queues limit buffering. Skipped upload intervals and queue drops are
-counted and can mark a recording degraded. Actual FPS must pass preflight.
+by arrival time, not phone sensor exposure time. Capture and JPEG encoding run
+independently of acknowledgements, with at most four outstanding frames at 15 FPS
+or eight at 30 FPS. The browser skips fresh frames when encoding or upload capacity
+is full; collector queues remain bounded. Skips and queue drops are counted and can
+mark a recording degraded. Actual FPS must pass preflight.
+
+The phone page shows observed camera FPS, acknowledged delivery FPS, JPEG encoding
+time, acknowledgement delay, and frames in flight. High acknowledgement delay
+includes network travel and collector decoding; it is not a clock-offset estimate.
+JPEGs use `OffscreenCanvas.convertToBlob` where available, with a synchronous JPEG
+fallback for older browsers, avoiding idle-scheduled canvas encoding. WebSocket
+compression is disabled because JPEG frames are already compressed. A slow phone
+camera or insufficient upload bandwidth can still limit the achievable rate.
 
 Change `PHONE_HOST` and rerun `make phone-cert` and `make phone` when the address
 changes. The existing CA is reused. `make phone-off` removes the extra listeners.

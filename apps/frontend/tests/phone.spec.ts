@@ -1,5 +1,9 @@
 import { test, expect } from "@playwright/test";
 
+// Give the simulated camera a cadence divisible by the paired 15 FPS. Chrome's
+// default 20 FPS fake source can negotiate down to 10 FPS under a 15 FPS cap.
+test.use({ launchOptions: { args: ["--use-fake-device-for-media-stream=fps=30"] } });
+
 test("pair a phone over HTTPS, record synchronized video, and remove its session", async ({
   page,
   browser,
@@ -79,7 +83,7 @@ test("pair a phone over HTTPS, record synchronized video, and remove its session
       "Streaming 640 × 480",
       { timeout: 15000 },
     );
-    await expect(phone.locator(".phone-counters")).not.toContainText(
+    await expect(phone.locator(".phone-counters").first()).not.toContainText(
       /^0 frames delivered/,
     );
     expect(new URL(phone.url()).hash).toBe("");

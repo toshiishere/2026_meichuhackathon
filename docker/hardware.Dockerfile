@@ -11,4 +11,4 @@ COPY configs configs
 COPY firmware firmware
 COPY scripts scripts
 ENV PYTHONUNBUFFERED=1 DATA_DIR=/data HARDWARE_MODE=real
-CMD ["uvicorn", "apps.hardware_service.app.main:app", "--host", "0.0.0.0", "--port", "8001", "--ws-max-size", "2097152"]
+CMD ["uvicorn", "apps.hardware_service.app.main:app", "--host", "0.0.0.0", "--port", "8001", "--ws-max-size", "2097152", "--ws-per-message-deflate", "false"]

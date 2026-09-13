@@ -2,7 +2,8 @@
 
 Phone performance.now() is preserved, NEVER used as the host synchronization
 clock. Frames are stamped on websocket message receipt, before JPEG decoding.
-Each upload is acknowledged to bound browser/network buffering to one frame.
+Each upload is acknowledged; the browser allows a bounded window of outstanding
+frames so capture does not wait for a network round trip after every JPEG.
 """
 
 import math

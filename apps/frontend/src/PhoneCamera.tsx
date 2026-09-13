@@ -1,4 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
+import { startPhoneUpload, type UploadStats } from "./phoneUpload";
+
+function wideCameraScore(camera: MediaDeviceInfo) {
+  const label = camera.label;
+  if (/front|user|selfie|前置|前置鏡頭|前置镜头/i.test(label)) return 0;
+  if (/ultra[\s-]*wide|0[.,]5\s*[x×]|超廣角|超广角/i.test(label)) return 2;
+  return /\bwide\b|廣角|广角/i.test(label) ? 1 : 0;
+}
 
 export function PhoneCamera() {
   const [status, setStatus] = useState("Ready to connect");
@@ -7,11 +16,15 @@ export function PhoneCamera() {
   const [busy, setBusy] = useState(false);
   const [frames, setFrames] = useState(0);
   const [skipped, setSkipped] = useState(0);
-  const [facing, setFacing] = useState("environment");
+  const [uploadStats, setUploadStats] = useState<UploadStats | null>(null);
+  const [cameraChoice, setCameraChoice] = useState("auto");
+  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
+  const [cameraLabel, setCameraLabel] = useState("");
+  const [previewReady, setPreviewReady] = useState(false);
   const video = useRef<HTMLVideoElement>(null);
   const socket = useRef<WebSocket | null>(null);
   const media = useRef<MediaStream | null>(null);
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const upload = useRef<ReturnType<typeof startPhoneUpload> | null>(null);
   const wakeLock = useRef<any>(null);
   const generation = useRef(0);
   const credentials = useRef(new URLSearchParams(location.hash.slice(1)));
@@ -22,8 +35,8 @@ export function PhoneCamera() {
     message = "Camera stopped. Create a new pairing link to reconnect.",
   ) {
     generation.current++;
-    if (timer.current) clearInterval(timer.current);
-    timer.current = null;
+    upload.current?.stop();
+    upload.current = null;
     socket.current?.close();
     socket.current = null;
     media.current?.getTracks().forEach((track) => track.stop());
@@ -32,6 +45,8 @@ export function PhoneCamera() {
     wakeLock.current?.release().catch(() => {});
     wakeLock.current = null;
     setActive(false);
+    setPreviewReady(false);
+    setCameraLabel("");
     setBusy(false);
     setStatus(message);
   }
@@ -48,6 +63,105 @@ export function PhoneCamera() {
       stop();
     };
   }, []);
+
+  async function openCamera(
+    choice: string,
+    current: number,
+    settings = { width: 1280, height: 720, fps: 30 },
+  ) {
+    // Release the previous lens first: phones often cannot open two at once.
+    media.current?.getTracks().forEach((track) => track.stop());
+    media.current = null;
+    setPreviewReady(false);
+    const dimensions = {
+      width: { ideal: settings.width },
+      height: { ideal: settings.height },
+      frameRate: { ideal: settings.fps, max: settings.fps },
+    };
+    const acquire = async (deviceId?: string) => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          ...dimensions,
+          ...(deviceId
+            ? { deviceId: { exact: deviceId } }
+            : {
+                facingMode: {
+                  ideal: choice === "user" ? "user" : "environment",
+                },
+              }),
+        },
+      });
+      if (current !== generation.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return null;
+      }
+      media.current = stream;
+      return stream;
+    };
+    let stream = await acquire(
+      choice.startsWith("device:") ? choice.slice(7) : undefined,
+    );
+    if (!stream) return null;
+    // Camera labels and additional lenses usually become available only after
+    // permission is granted. No pairing token is consumed by a local preview.
+    const available = (await navigator.mediaDevices.enumerateDevices()).filter(
+      (device) => device.kind === "videoinput" && device.deviceId,
+    );
+    if (current !== generation.current) return null;
+    setCameras(available);
+    if (choice === "auto") {
+      const preferred = [...available]
+        .filter((device) => wideCameraScore(device) > 0)
+        .sort((a, b) => wideCameraScore(b) - wideCameraScore(a))[0];
+      if (
+        preferred &&
+        preferred.deviceId !== stream.getVideoTracks()[0].getSettings().deviceId
+      ) {
+        stream.getTracks().forEach((track) => track.stop());
+        try {
+          stream = await acquire(preferred.deviceId);
+        } catch {
+          if (current !== generation.current) return null;
+          // Keep automatic mode usable if an advertised lens cannot be opened.
+          stream = await acquire();
+        }
+        if (!stream) return null;
+      }
+    }
+    const track = stream.getVideoTracks()[0];
+    track.onended = () => {
+      if (current === generation.current)
+        stop("Phone camera access ended. Pair again to reconnect.");
+    };
+    video.current!.srcObject = stream;
+    await video.current!.play();
+    if (current !== generation.current) return null;
+    setCameraLabel(track.label || "Selected camera");
+    setPreviewReady(true);
+    return stream;
+  }
+
+  async function previewCamera(choice = cameraChoice) {
+    if (!secure || active || busy) return;
+    setError("");
+    setBusy(true);
+    setStatus("Allow camera access to choose a lens…");
+    const current = ++generation.current;
+    try {
+      if (await openCamera(choice, current))
+        setStatus(
+          "Preview only. Choose a camera, then start to connect to the collector.",
+        );
+    } catch (e) {
+      if (current === generation.current) {
+        stop("Camera unavailable. Choose another camera and try again.");
+        setError((e as Error).message);
+      }
+    } finally {
+      if (current === generation.current) setBusy(false);
+    }
+  }
 
   function start() {
     if (!secure) {
@@ -69,18 +183,13 @@ export function PhoneCamera() {
     setStatus("Connecting to the collector…");
     setFrames(0);
     setSkipped(0);
+    setUploadStats(null);
     const current = ++generation.current;
     const ws = new WebSocket(
       `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/phone/stream`,
     );
     socket.current = ws;
-    let settings: any,
-      sending = false,
-      sequence = 0,
-      skippedCount = 0,
-      awaitingSince = 0;
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d")!;
+    let settings: any;
     ws.onopen = () => ws.send(JSON.stringify({ id, token }));
     ws.onerror = () => {
       if (current === generation.current) {
@@ -106,29 +215,7 @@ export function PhoneCamera() {
         if (data.type === "settings") {
           settings = data;
           setStatus("Allow camera access on this phone…");
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: {
-              facingMode: { ideal: facing },
-              width: { ideal: data.width },
-              height: { ideal: data.height },
-              frameRate: { ideal: data.fps, max: data.fps },
-            },
-          });
-          if (current !== generation.current) {
-            stream.getTracks().forEach((t) => t.stop());
-            return;
-          }
-          media.current = stream;
-          stream.getVideoTracks()[0].onended = () => {
-            if (current === generation.current)
-              stop("Phone camera access ended. Pair again to reconnect.");
-          };
-          video.current!.srcObject = stream;
-          await video.current!.play();
-          if (current !== generation.current) return;
-          canvas.width = data.width;
-          canvas.height = data.height;
+          if (!(await openCamera(cameraChoice, current, data))) return;
           ws.send(
             JSON.stringify({
               type: "ready",
@@ -154,78 +241,25 @@ export function PhoneCamera() {
               else lock.release();
             })
             .catch(() => {});
-          timer.current = setInterval(() => {
-            if (
-              current !== generation.current ||
-              ws.readyState !== WebSocket.OPEN
-            )
-              return;
-            if (sending || ws.bufferedAmount > 0) {
-              skippedCount++;
-              setSkipped(skippedCount);
-              if (performance.now() - awaitingSince > 5000) {
-                stop();
-                setError(
-                  "The collector stopped acknowledging frames. Check Wi-Fi and pair again.",
-                );
-              }
-              return;
-            }
-            const v = video.current!;
-            if (v.readyState < 2) return;
-            sending = true;
-            awaitingSince = performance.now();
-            const captureMs = performance.now();
-            context.fillStyle = "black";
-            context.fillRect(0, 0, canvas.width, canvas.height);
-            const scale = Math.min(
-              canvas.width / v.videoWidth,
-              canvas.height / v.videoHeight,
-            );
-            const w = v.videoWidth * scale,
-              h = v.videoHeight * scale;
-            context.drawImage(
-              v,
-              (canvas.width - w) / 2,
-              (canvas.height - h) / 2,
-              w,
-              h,
-            );
-            canvas.toBlob(
-              async (blob) => {
-                if (
-                  current !== generation.current ||
-                  ws.readyState !== WebSocket.OPEN
-                )
-                  return;
-                if (!blob) {
-                  stop();
-                  setError("Phone JPEG encoding failed.");
-                  return;
-                }
-                const jpeg = await blob.arrayBuffer();
-                if (
-                  current !== generation.current ||
-                  ws.readyState !== WebSocket.OPEN
-                )
-                  return;
-                const bytes = new Uint8Array(20 + jpeg.byteLength);
-                bytes.set([67, 83, 73, 49]);
-                const header = new DataView(bytes.buffer);
-                header.setUint32(4, sequence++);
-                header.setFloat64(8, captureMs);
-                header.setUint32(16, skippedCount);
-                bytes.set(new Uint8Array(jpeg), 20);
-                ws.send(bytes);
-              },
-              "image/jpeg",
-              0.8,
-            );
-          }, 1000 / settings.fps);
+          upload.current = startPhoneUpload(
+            video.current!,
+            ws,
+            settings,
+            (stats) => {
+              if (current !== generation.current) return;
+              setFrames(stats.frames);
+              setSkipped(stats.skipped);
+              setUploadStats(stats);
+            },
+            (error) => {
+              if (current !== generation.current) return;
+              stop();
+              setError(error.message);
+            },
+          );
         }
         if (data.type === "ack") {
-          sending = false;
-          setFrames(data.frame_idx + 1);
+          upload.current?.ack(data.frame_idx);
         }
       } catch (e) {
         if (current === generation.current) {
@@ -264,18 +298,42 @@ export function PhoneCamera() {
         />
         <p role="status">{status}</p>
         <label className="field">
-          <span>Camera direction</span>
+          <span>Camera</span>
           <select
-            aria-label="Camera direction"
+            aria-label="Phone camera selection"
             disabled={active || busy}
-            value={facing}
-            onChange={(e) => setFacing(e.target.value)}
+            value={cameraChoice}
+            onChange={(e) => {
+              const choice = e.target.value;
+              setCameraChoice(choice);
+              if (previewReady) void previewCamera(choice);
+            }}
           >
-            <option value="environment">Rear camera</option>
+            <option value="auto">Automatic · prefer rear wide-angle</option>
+            <option value="environment">Default rear camera</option>
             <option value="user">Front camera</option>
+            {cameras.map((camera, index) => (
+              <option key={camera.deviceId} value={`device:${camera.deviceId}`}>
+                {camera.label || `Camera ${index + 1}`}
+                {wideCameraScore(camera) > 0 ? " · wide-angle" : ""}
+              </option>
+            ))}
           </select>
         </label>
+        {cameraLabel && <p className="hint">Using: {cameraLabel}</p>}
+        <p className="hint">
+          Tap Choose camera / preview to allow access and list the available
+          lenses. Automatic prefers an identified ultra-wide camera, then
+          wide-angle, then the default rear camera. Some browsers expose only a
+          subset of phone cameras. Choose your lens before starting the stream.
+        </p>
         <div className="actions">
+          <button
+            disabled={active || busy || !secure}
+            onClick={() => void previewCamera()}
+          >
+            Choose camera / preview
+          </button>
           <button
             className="primary"
             disabled={active || busy || !secure}
@@ -284,17 +342,37 @@ export function PhoneCamera() {
             Start phone camera
           </button>
           <button
-            disabled={!active && !busy}
+            disabled={!active && !busy && !previewReady}
             className="danger"
-            onClick={() => stop()}
+            onClick={() =>
+              stop(
+                active || socket.current
+                  ? undefined
+                  : "Camera preview stopped.",
+              )
+            }
           >
             Stop phone camera
           </button>
         </div>
         <div className="phone-counters">
           <span>{frames} frames delivered</span>
-          <span>{skipped} upload intervals skipped</span>
+          <span>{skipped} frames skipped before upload</span>
         </div>
+        {uploadStats && (
+          <div
+            className="phone-counters"
+            aria-label="Phone streaming performance"
+          >
+            <span>Camera: {uploadStats.cameraFps.toFixed(1)} FPS</span>
+            <span>Delivered: {uploadStats.deliveredFps.toFixed(1)} FPS</span>
+            <span>JPEG: {uploadStats.encodeMs.toFixed(0)} ms</span>
+            <span>Acknowledgement: {uploadStats.ackMs.toFixed(0)} ms</span>
+            <span>
+              In flight: {uploadStats.inFlight}/{uploadStats.maxInFlight}
+            </span>
+          </div>
+        )}
         <p className="hint">
           Keep this page visible and the phone awake. Return to the computer to
           select this camera, run preflight, and start recording. Host
@@ -419,6 +497,18 @@ export function PhoneSetup({
       </div>
       {link && (
         <div className="pair-link">
+          <figure className="pair-qr">
+            <QRCodeSVG
+              value={link}
+              size={256}
+              level="M"
+              marginSize={4}
+              title="Scan to open the phone camera pairing link"
+            />
+            <figcaption>
+              Scan with your phone to open the pairing link
+            </figcaption>
+          </figure>
           <label className="field">
             <span>One-use phone link · expires in 10 minutes</span>
             <input aria-label="Phone pairing link" readOnly value={link} />

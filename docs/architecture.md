@@ -44,15 +44,23 @@ Phone cameras connect through an optional nginx TLS listener, which serves only
 pairing is created through the local administration API. The upload WebSocket goes
 directly to the hardware service; the backend does not forward acquisition frames.
 The hardware service checks one-use expiring credentials, timestamps each complete
-message before JPEG decoding, acknowledges one frame at a time, and delivers decoded
+message before JPEG decoding, acknowledges each accepted frame, and delivers decoded
 frames through bounded per-camera subscriber queues. The regular camera interface
 supports preview, preflight, recording, and disconnect/stall failure handling.
 
 Phone sequence and `performance.now()` capture times are retained as nullable frame
 index schema 1.1 columns. They never replace the shared host clock. Native phone
 resolution is shown in discovery; the browser scales with letterboxing to the paired
-output size. Network/JPEG delay is unmeasured, and client skips and queue drops are
+output size. Sensor-to-host latency remains unmeasured; the phone displays local
+encoding duration and send-to-acknowledgement delay for diagnosis. Client skips and queue drops are
 reported. No clock-offset correction or synthetic frame interpolation is applied.
+
+Phone capture is paced by new video frames, independently of acknowledgements.
+One JPEG encode and at most four unacknowledged frames at 15 FPS (eight at 30 FPS)
+bound the browser work. Frames are skipped if encoding or transmission capacity is
+full. A five-second acknowledgement/encoding watchdog stops stalled uploads.
+OffscreenCanvas JPEG encoding avoids idle-task scheduling, with a synchronous
+older-browser fallback. WebSocket JPEG compression is disabled in both service images.
 
 Serial discovery filters actual tty nodes to `/dev/ttyUSB[0-9]` and
 `/dev/ttyACM[0-9]`, retaining available stable by-id aliases. Validation checks the

@@ -140,3 +140,31 @@ current connections by USB identity; removal affects registration metadata only.
 No ESP32 was connected at the end of validation, so the direct-output firmware
 has not been flashed or physically rate-tested in this follow-up. The compiled
 C3 native-USB cache key is `15e7fe4811b919db2369bb82`.
+
+### Phone upload FPS follow-up
+
+The former browser loop allowed only one outstanding frame, waiting through JPEG
+encoding, network travel, collector decoding, and acknowledgement before another
+capture. A 120 ms acknowledgement delay alone limits that design to less than
+8.34 FPS. The revised loop encodes independently of a bounded acknowledgement
+window and uses new video frames instead of repeatedly capturing a timer's last
+frame. The JPEG wire header and host receipt timestamp semantics are unchanged.
+
+Three focused Chrome regressions use a simulated 30 FPS camera and delay actual
+collector acknowledgements by 120 ms. Collector camera tests measured:
+
+- 640 × 480, requested 15 FPS: **15.00 FPS**.
+- 1280 × 720, requested 30 FPS: **29.81 FPS**.
+- 1280 × 720, synchronous older-browser encoder fallback: **29.59 FPS**.
+
+All three also withhold acknowledgements and verify that outstanding uploads stay
+within their configured window and the stream stops with an explicit stall error.
+These are controlled browser/collector measurements, not measurements on the
+user's phone or Wi-Fi. Live phone diagnostics now report observed camera FPS,
+acknowledged delivery FPS, JPEG duration, and acknowledgement delay to distinguish
+remaining camera, encoder, and network limitations.
+
+The full HTTPS phone pairing, synchronized recording, playback, and session-removal
+regression also passes. Its simulated camera is explicitly set to 30 FPS so the
+15 FPS capture cap does not reduce Chrome's default 20 FPS fake source to 10 FPS.
+No duplicate camera frames are inserted to satisfy the requested rate.
