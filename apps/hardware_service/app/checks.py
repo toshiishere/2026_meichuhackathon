@@ -5,7 +5,7 @@ import time
 import tempfile
 from pathlib import Path
 from apps.common.config import DEFAULTS
-from .csi import parse_csi, SequenceTracker
+from .csi import parse_csi, SequenceTracker, TransportTracker
 from .sources import SerialSource, CameraSource, validate_port
 
 
@@ -15,6 +15,8 @@ def serial_test(request, stop=None):
     start = time.monotonic()
     tracker, count, errors, noise, rssi = SequenceTracker(), 0, 0, 0, 0
     monitor = []
+    transport = {}
+    transport_tracker = TransportTracker()
     try:
         while not stop.is_set() and time.monotonic() - start < request.seconds:
             value = source.read(stop)
@@ -22,18 +24,29 @@ def serial_test(request, stop=None):
                 continue
             raw, timestamp = value
             line = raw.decode("utf-8", errors="replace")
-            if len(monitor) < 100:
-                monitor.append({"host_timestamp_ns": timestamp, "line": line[:4096]})
             try:
-                packet = parse_csi(line)
+                packet = parse_csi(raw)
                 if packet:
                     tracker.update(packet["tx_seq"])
                     count += 1
+                    transport.update(transport_tracker.update(packet))
+                    if packet["firmware_layout"] == "binary_v1":
+                        line = f"CSI_BINARY seq={packet['tx_seq']} samples={packet['len']} rssi={packet['rssi']} firmware_queue_drops_total={packet['firmware_queue_drops_total']}"
                     rssi += packet["rssi"]
+                    for key in (
+                        "firmware_layout",
+                        "firmware_received_total",
+                        "firmware_queue_drops_total",
+                        "firmware_invalid_total",
+                    ):
+                        if key in packet:
+                            transport[key] = packet[key]
                 else:
                     noise += 1
             except ValueError:
                 errors += 1
+            if len(monitor) < 100:
+                monitor.append({"host_timestamp_ns": timestamp, "line": line[:4096]})
     finally:
         source.close()
     elapsed = time.monotonic() - start
@@ -47,8 +60,11 @@ def serial_test(request, stop=None):
         non_csi_lines=noise,
         average_rssi=rssi / count if count else None,
         **tracker.snapshot(),
+        transport=transport,
         passed=rate >= request.expected_rate_hz * request.min_rate_ratio
-        and errors == 0,
+        and errors == 0
+        and not transport.get("firmware_queue_drops", 0)
+        and not transport.get("firmware_invalid", 0),
         serial_monitor=monitor,
     )
 
@@ -74,6 +90,14 @@ def camera_test(config, seconds=3, stop=None):
         device=config.device,
         frames=count,
         measured_fps=fps,
+        requested_fps=config.fps,
+        duration_seconds=time.monotonic() - start,
+        diagnostics=getattr(source, "diagnostics", {}),
+        rate_note=(
+            "Measured frame rate is below the requested rate; inspect negotiated mode, exposure controls, lighting, and transport drops."
+            if fps < config.fps * DEFAULTS["min_rate_ratio"]
+            else "Measured rate meets the requested threshold."
+        ),
         resolution=size,
         last_frame_timestamp_ns=last,
         passed=count > 1
@@ -96,10 +120,11 @@ def preflight(config, root: Path, stop=None):
         minimum_free_bytes=DEFAULTS["minimum_free_bytes"],
         passed=free >= DEFAULTS["minimum_free_bytes"],
     )
-    devices = [validate_port(x.port) for x in [config.sender, *config.receivers]]
+    selected_devices = ([config.sender] if config.sender else []) + config.receivers
+    devices = [validate_port(x.port) for x in selected_devices]
     if len({x["identity"] for x in devices}) != len(devices):
         raise ValueError("Selected ports resolve to the same physical device")
-    for selected, current in zip([config.sender, *config.receivers], devices):
+    for selected, current in zip(selected_devices, devices):
         if selected.identity and selected.identity != current["identity"]:
             raise ValueError(
                 f"{selected.logical_name} identity changed; refresh device assignments"
@@ -144,7 +169,8 @@ def preflight(config, root: Path, stop=None):
         and storage["passed"]
         and cam["passed"]
         and all(r["passed"] for r in receivers),
-        sender=devices[0],
+        sender=devices[0] if config.sender else None,
+        sender_connection="usb" if config.sender else "external",
         receivers=receivers,
         camera=cam,
         storage=storage,

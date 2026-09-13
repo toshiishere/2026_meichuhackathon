@@ -17,11 +17,17 @@ def read_csv(path):
         return list(csv.DictReader(io.TextIOWrapper(stream)))
 
 
-def test_multi_receiver_video_timestamps_and_immutable_raw(config, tmp_path):
+@pytest.mark.parametrize("external_sender", [False, True])
+def test_multi_receiver_video_timestamps_and_immutable_raw(
+    config, tmp_path, external_sender
+):
+    if external_sender:
+        config.sender = None
     recorder = Recorder(config, tmp_path)
     metadata = recorder.run()
     assert metadata["status"] == "complete", metadata["errors"]
     assert metadata["hardware_mode"] == "synthetic"
+    assert (metadata["configuration"]["sender"] is None) == external_sender
     root = tmp_path / "sessions" / config.session_id
     frame_rows = pq.read_table(root / "raw/video_frames.parquet").to_pylist()
     assert len(frame_rows) >= 15
@@ -167,13 +173,16 @@ def test_startup_crash_recovery_keeps_artifacts(tmp_path, monkeypatch):
 def test_recording_requires_fresh_serial_readiness(config, tmp_path, monkeypatch):
     from apps.hardware_service.app.sources import SerialSource
     from apps.hardware_service.app.recorder import DEFAULTS
-    monkeypatch.setitem(DEFAULTS, 'stall_timeout_seconds', 0.05)
+
+    monkeypatch.setitem(DEFAULTS, "stall_timeout_seconds", 0.05)
+
     def silent(self, stop):
         stop.wait(0.01)
         return None
-    monkeypatch.setattr(SerialSource, 'read', silent)
+
+    monkeypatch.setattr(SerialSource, "read", silent)
     recorder = Recorder(config, tmp_path)
     result = recorder.run()
-    assert result['status'] == 'incomplete'
+    assert result["status"] == "incomplete"
     assert recorder.start_ns is None
-    assert any('no valid CSI after opening' in error for error in result['errors'])
+    assert any("no valid CSI after opening" in error for error in result["errors"])

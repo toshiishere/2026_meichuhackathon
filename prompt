@@ -1,3 +1,0 @@
-1. make the blink of esp32 to be blink the LED on the board, not the  external LEDs
-2. since the packet rate is around ~65 in each test. modify csi_recv so the callback queues CSI and a separate task sends compact binary records. or implement other method that would keep the rate up.
-3. in test camera it shows 15.0 FPS · 70 frames · 1280 × 720, but im using 30fps one. find the reason why it doesn't work

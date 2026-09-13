@@ -16,6 +16,7 @@ parser.add_argument(
 )
 parser.add_argument("--gpio", type=int)
 parser.add_argument("--led-type", choices=["gpio", "rgb"], default="gpio")
+parser.add_argument("--csi-transport", choices=["auto", "usb", "uart"], default="auto")
 args = parser.parse_args()
 request = FlashRequest(
     port="/dev/ttyUSB0",
@@ -24,5 +25,6 @@ request = FlashRequest(
     operation="build",
     gpio=args.gpio,
     led_type=args.led_type,
+    csi_transport=args.csi_transport,
 )
 print(flash(request, print, threading.Event()))

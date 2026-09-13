@@ -90,3 +90,32 @@ def test_backend_registry_artifacts_and_request_validation(tmp_path, monkeypatch
         assert (
             client.post("/api/hardware/arbitrary-command", json={}).status_code == 404
         )
+        # A disconnected device can be forgotten without querying hardware or
+        # changing historical recordings. Its logical name becomes reusable.
+        main.registry.put(
+            "devices",
+            "disconnected",
+            {**board, "identity": "disconnected", "logical_name": "old_rx"},
+        )
+        before = (root / "metadata.json").read_bytes()
+        removed = client.post("/api/devices/remove", json={"identity": "disconnected"})
+        assert removed.status_code == 200
+        assert removed.json() == {"identity": "disconnected", "removed": True}
+        assert main.registry.get("devices", "disconnected") is None
+        assert (
+            client.post(
+                "/api/devices", json={**board, "logical_name": "old_rx"}
+            ).status_code
+            == 200
+        )
+        assert (root / "metadata.json").read_bytes() == before
+        assert (root / "raw/csi_rx.csv.zst").read_bytes() == b"raw-content"
+        assert (
+            client.post(
+                "/api/devices/remove", json={"identity": "disconnected"}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post("/api/devices/remove", json={"identity": ""}).status_code == 422
+        )

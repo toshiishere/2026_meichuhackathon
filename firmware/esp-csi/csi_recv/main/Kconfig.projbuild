@@ -1,0 +1,12 @@
+menu "CSI collection transport"
+    choice CSI_OUTPUT_TRANSPORT
+        prompt "Binary CSI output connection"
+        default CSI_OUTPUT_USB if SOC_USB_SERIAL_JTAG_SUPPORTED
+        default CSI_OUTPUT_UART
+        config CSI_OUTPUT_USB
+            bool "Native USB Serial/JTAG (direct bulk writes)"
+            depends on SOC_USB_SERIAL_JTAG_SUPPORTED
+        config CSI_OUTPUT_UART
+            bool "UART (USB-to-UART bridge, direct buffered writes)"
+    endchoice
+endmenu

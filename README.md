@@ -26,12 +26,13 @@ make mock DOCKER='sudo docker'
 
 In **Hardware Setup**:
 
-1. Select `synthetic://tx`, assign `tx_main`, role **CSI Sender**, and save.
+1. Optionally select `synthetic://tx`, assign `tx_main`, role **CSI Sender**, and save.
 2. Select `synthetic://rx0`, assign `rx_left`, role **CSI Receiver**, and save.
 3. Optionally assign `synthetic://rx1` as `rx_right`.
 4. Run **CSI test / monitor** on a receiver. Open the job result and logs.
 5. Open the camera preview, then close it and run **Test camera**.
-6. In **Data Collection**, select the sender, receivers, and camera. Enter a unique
+6. In **Data Collection**, select the receivers and camera. Leave the optional sender
+   at **External / battery-powered sender (no USB)** unless you want to track a USB-connected sender. Enter a unique
    session ID and experiment details. Run preflight, then **Start recording**.
 7. **Stop recording** whenever desired, or set an optional duration. Wait for
    `complete`, then open **Sessions** for playback, metadata, quality, and downloads.
@@ -45,7 +46,9 @@ flashing is unavailable there.
 ## Real hardware
 
 Required: an ESP32 sender and one or more ESP32 receivers running the preserved
-Espressif CSI projects, USB serial connections, and either a Linux USB/UVC camera or a phone browser camera.
+Espressif CSI projects, USB serial connections for the receivers, and either a Linux USB/UVC camera or a phone browser camera.
+The sender can run from a battery bank with its USB disconnected from the collector.
+Flash it first, then power it on before preflight; all boards must use the same WiFi channel.
 
 ```bash
 make down
@@ -74,6 +77,13 @@ is excluded. This filters the application list; it does not remove Linux device 
 paths and USB identities preserve assignments across tty renumbering. Devices
 without unique USB serials fall back to stable paths, USB location, then tty path;
 verify these assignments again after moving USB sockets.
+
+**Registered logical names** lists every saved assignment, including disconnected
+boards, its role, target, USB identity, and current port. Disconnected entries show
+the last registered port separately. Click **↻ Refresh** after reconnecting.
+**Remove registration** frees a name for reuse without deleting saved sessions or
+changing board firmware. Reconnected boards whose registration was removed appear
+as unassigned.
 
 **Probe board** runs esptool and returns actual chip/MAC/flash output. It does not
 write flash, but entering the bootloader may reset the board. Choose its actual
@@ -180,8 +190,11 @@ After a later `make up` or `make mock`, rerun `make phone` to enable them again.
 Preflight verifies all selected devices, identity consistency, actual parsable
 CSI arrival and rate, requested camera resolution and measured FPS, writable
 storage, and at least 1 GiB free disk (configurable). It runs again on every start.
-No override bypasses failed checks. The sender is discovered; its transmission is
-verified indirectly through received CSI packets, not by opening its serial port.
+No override bypasses failed checks. Sender selection is optional and defaults to
+external power; its transmission is verified through received CSI packets. If a
+USB-connected sender is explicitly selected, preflight also checks its identity
+and presence. No sender serial stream is used for synchronization. External sender
+sessions store `configuration.sender: null` and preflight reports `sender_connection: external`.
 
 All devices and outputs initialize before a shared acquisition gate opens.
 CSI packets and camera frames receive **`time.monotonic_ns()`** timestamps in the
@@ -191,10 +204,13 @@ ESP local timestamps are microseconds (uint32, wrapping); UTC time is only descr
 requests do not define serial or USB camera acquisition timestamps.
 
 Use `tx_seq` to align receivers. Each raw row also preserves ESP local timestamp,
-original `id`/`seq`, MAC, RSSI, all emitted PHY fields, gain context when emitted,
-`first_word`, exact CSI array string, and original CSV line. Arrays are not clipped,
-converted to amplitude, or assigned a fixed subcarrier count. The source emits
-**imaginary then real** values, including gain-compensated int16 samples.
+original `id`/`seq`, MAC, RSSI, all emitted PHY fields, gain context, and
+`first_word`. Binary receiver firmware keeps original signed int8 samples and the
+entire CRC-protected wire frame; legacy CSV keeps its gain-compensated int16 values
+and original line. Each new row identifies its sample representation. Arrays are
+not clipped, converted to amplitude, or assigned a fixed subcarrier count. Both
+formats preserve **imaginary then real** ordering. See the [binary CSI transport
+and firmware upgrade guide](docs/csi-binary-v1.md).
 
 Sequence gaps, duplicates, backwards/reset events, parse errors, queue overflows,
 per-receiver first/last timestamps and camera frame counts are recorded. A backwards
@@ -317,10 +333,15 @@ accuracy or physical LED behavior.
   compatible firmware, RX 921600 baud, and matching MAC filtering. Use CSI test
   to inspect boot messages and malformed input.
 - **Unexpected CSI format:** this parser supports the 25-field legacy and
-  15-field compact outputs in the preserved source. Unknown layouts are rejected
+  15-field compact CSV outputs plus CRC-protected binary v1. Unknown layouts are rejected
   with counts and retained original lines. Add a documented parser variant before
   collecting with different firmware.
-- **Camera format/FPS mismatch:** review supported V4L2 formats, choose a supported
+- **Camera format/FPS mismatch:** by default, the collector disables the V4L2
+  dynamic-exposure frame-rate control when available. This prevents supported
+  cameras from silently dropping from 30 to 15 FPS for longer low-light exposure.
+  Auto exposure stays enabled. Uncheck **Keep requested FPS** to allow dynamic
+  frame rates. Tests show requested/measured FPS and negotiated format/exposure
+  diagnostics. If the rate is still low, add light and review supported V4L2 formats, choose a supported
   width/height/FPS, and check USB bandwidth. The requested dimensions must match
   actual frames. This implementation requires even dimensions for H.264 YUV420.
 - **Hardware busy:** close live preview, wait for the current job, or stop recording.

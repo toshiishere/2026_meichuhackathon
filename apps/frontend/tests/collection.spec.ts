@@ -23,7 +23,11 @@ test("configure synthetic boards, verify streams, record and inspect artifacts",
     await page.getByLabel("Logical name", { exact: true }).fill(name);
     await page.getByLabel("Role", { exact: true }).selectOption(role);
     await page.getByRole("button", { name: "Save assignment" }).click();
-    await expect(page.getByRole("cell", { name, exact: true })).toBeVisible();
+    await expect(
+      page
+        .getByRole("region", { name: "Registered logical names" })
+        .getByRole("cell", { name, exact: true }),
+    ).toBeVisible();
   }
   await page
     .getByRole("button", { name: "CSI test / monitor", exact: true })
@@ -56,6 +60,7 @@ test("configure synthetic boards, verify streams, record and inspect artifacts",
     .getByRole("button", { name: "Data Collection", exact: true })
     .click();
   const sid = `browser_${Date.now()}`;
+  await expect(page.getByLabel("CSI sender (optional)")).toHaveValue("");
   await page.getByLabel("Session id", { exact: true }).fill(sid);
   await page.getByLabel("Subject id", { exact: true }).fill("P01");
   await page.getByLabel("Room id", { exact: true }).fill("roomA");
@@ -115,6 +120,7 @@ test("configure synthetic boards, verify streams, record and inspect artifacts",
   const data = await (await request.get(`/api/sessions/${sid}`)).json();
   expect(data.status).toBe("complete");
   expect(data.configuration.subject_id).toBe("P01");
+  expect(data.configuration.sender).toBeNull();
   expect(
     data.artifacts.some((x: any) => x.path === "raw/csi_rx_left.csv.zst"),
   ).toBe(true);

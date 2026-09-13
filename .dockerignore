@@ -6,3 +6,6 @@ data
 **/node_modules
 **/dist
 .pytest_cache
+
+firmware/**/build
+firmware/**/managed_components

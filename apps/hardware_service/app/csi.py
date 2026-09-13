@@ -8,6 +8,7 @@ are removed in acquisition. `id`/`seq` is the sender uint32 counter in this sour
 import csv
 import json
 import re
+from .csi_wire import MAGIC, decode_binary
 
 LEGACY = (
     "type id mac rssi rate sig_mode mcs bandwidth smoothing not_sounding "
@@ -31,11 +32,20 @@ FIELDS = [
     "compensate_gain",
     "gain_agc",
     "gain_fft",
+    "sample_representation",
+    "raw_binary_base64",
+    "firmware_received_total",
+    "firmware_queue_drops_total",
+    "firmware_invalid_total",
 ]
 GAIN = re.compile(r"compensate_gain ([0-9.eE+-]+), agc_gain (-?\d+), fft_gain (-?\d+)")
 
 
-def parse_csi(line: str):
+def parse_csi(line: str | bytes):
+    if isinstance(line, bytes):
+        if line.startswith(MAGIC):
+            return decode_binary(line)
+        line = line.decode("utf-8", errors="replace")
     if not line.startswith("CSI_DATA,"):
         return None
     try:
@@ -68,6 +78,7 @@ def parse_csi(line: str):
         record["esp_local_timestamp"] = record["local_timestamp"] % 2**32
         record["firmware_layout"] = "legacy_25" if len(row) == 25 else "compact_15"
         record["raw_line"] = line
+        record["sample_representation"] = "gain_compensated_int16"
         return record
     except (csv.Error, TypeError, KeyError, json.JSONDecodeError) as e:
         raise ValueError(f"Malformed CSI: {e}") from e
@@ -104,3 +115,29 @@ class SequenceTracker:
             backwards_or_resets=self.backwards,
             wraps=self.wraps,
         )
+
+
+class TransportTracker:
+    """Delta firmware counters within this acquisition, excluding prior losses."""
+
+    def __init__(self):
+        self.last = {}
+        self.values = {}
+
+    def update(self, record):
+        for key in ("firmware_queue_drops", "firmware_invalid"):
+            total = record.get(key + "_total")
+            if total is None:
+                continue
+            if key in self.last:
+                delta = (total - self.last[key]) % 2**32
+                if delta < 2**31:
+                    self.values[key] = self.values.get(key, 0) + delta
+                else:
+                    self.values["firmware_counter_resets"] = (
+                        self.values.get("firmware_counter_resets", 0) + 1
+                    )
+            else:
+                self.values[key] = 0
+            self.last[key] = total
+        return self.values.copy()

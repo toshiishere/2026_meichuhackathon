@@ -9,6 +9,7 @@ from apps.common.storage import atomic_json
 from .sources import validate_port
 
 IDF_VERSION = "5.5.0"
+GENERATED_DIRS = {"build", "managed_components", ".git", "__pycache__"}
 
 
 def run_command(args, cwd, log, stop, timeout=1200):
@@ -82,6 +83,37 @@ def probe(port, log, stop):
     )
 
 
+def receiver_transport(request):
+    if request.csi_transport != "auto":
+        transport = request.csi_transport
+    else:
+        # Stable by-id paths preserve the connection type across tty renumbering.
+        transport = (
+            "usb"
+            if (
+                request.target != "esp32"
+                and (
+                    request.port.startswith("/dev/ttyACM") or "USB_JTAG" in request.port
+                )
+            )
+            else "uart"
+        )
+    if transport == "usb" and request.target == "esp32":
+        raise ValueError("ESP32 has no native USB Serial/JTAG; select UART output")
+    return transport
+
+
+def set_sdk_option(path, key, enabled):
+    lines = path.read_text().splitlines() if path.exists() else []
+    lines = [
+        line
+        for line in lines
+        if not line.startswith(key + "=") and line != f"# {key} is not set"
+    ]
+    lines.append(f"{key}=y" if enabled else f"# {key} is not set")
+    path.write_text("\n".join(lines) + "\n")
+
+
 def flash(request, log, stop):
     device = validate_port(request.port) if request.operation == "flash" else None
     if MODE == "synthetic":
@@ -105,7 +137,9 @@ def flash(request, log, stop):
     )
     digest = hashlib.sha256()
     for path in sorted(source.rglob("*")):
-        if path.is_file():
+        if path.is_file() and not GENERATED_DIRS.intersection(
+            path.relative_to(source).parts
+        ):
             digest.update(str(path.relative_to(source)).encode())
             digest.update(path.read_bytes())
     provenance = json.loads((ROOT / "firmware/provenance.json").read_text())
@@ -119,6 +153,8 @@ def flash(request, log, stop):
         esp_csi_git_commit=provenance["esp_csi_git_commit"],
         source_sha256=digest.hexdigest(),
     )
+    if request.firmware == "csi-recv":
+        build_config["csi_transport"] = receiver_transport(request)
     key = hashlib.sha256(json.dumps(build_config, sort_keys=True).encode()).hexdigest()[
         :24
     ]
@@ -132,7 +168,7 @@ def flash(request, log, stop):
         if project.exists():
             shutil.rmtree(project)
         project.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, project)
+        shutil.copytree(source, project, ignore=shutil.ignore_patterns(*GENERATED_DIRS))
         # Keep full known-working SDK config for its original target. For another
         # target, derive from the same sdkconfig.defaults (target-specific values
         # cannot safely be copied across chips).
@@ -142,6 +178,14 @@ def flash(request, log, stop):
         )
         if not preserved:
             sdk.unlink(missing_ok=True)
+        if request.firmware == "csi-recv":
+            output = build_config["csi_transport"]
+            for config_file in [
+                project / "sdkconfig.defaults",
+                *([sdk] if preserved else []),
+            ]:
+                set_sdk_option(config_file, "CONFIG_CSI_OUTPUT_USB", output == "usb")
+                set_sdk_option(config_file, "CONFIG_CSI_OUTPUT_UART", output == "uart")
         if request.firmware == "blink":
             sdk.unlink(missing_ok=True)
             defaults = project / "sdkconfig.defaults"

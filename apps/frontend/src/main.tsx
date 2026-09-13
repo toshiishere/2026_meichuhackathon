@@ -19,6 +19,7 @@ type Camera = {
   width: number;
   height: number;
   fps: number;
+  fixed_frame_rate: boolean;
   geometry: string;
 };
 const api = async (path: string, body?: unknown) => {
@@ -132,6 +133,7 @@ function App() {
   });
   const [gpio, setGpio] = useState("8");
   const [ledType, setLedType] = useState("gpio");
+  const [csiTransport, setCsiTransport] = useState("auto");
   const [activeLow, setActiveLow] = useState(false);
   const [camera, setCamera] = useState<Camera>({
     device: "",
@@ -139,6 +141,7 @@ function App() {
     height: 720,
     fps: 30,
     geometry: "",
+    fixed_frame_rate: true,
   });
   const [preview, setPreview] = useState("");
   function generateUUID() {
@@ -249,15 +252,16 @@ function App() {
     }
     setSelectedPort((old) => old || p[0]?.port || "");
     setCamera((old) => ({ ...old, device: old.device || c[0]?.device || "" }));
-    setSender(
-      (old) =>
-        old || b.find((x: Board) => x.role === "csi_sender")?.identity || "",
-    );
+    setSender((old) => (b.some((x: Board) => x.identity === old) ? old : ""));
     setReceivers((old) =>
       old.length
         ? old
         : b
-            .filter((x: Board) => x.role === "csi_receiver")
+            .filter(
+              (x: Board) =>
+                x.role === "csi_receiver" &&
+                p.some((port: Json) => port.identity === x.identity),
+            )
             .map((x: Board) => x.identity),
     );
   };
@@ -296,17 +300,15 @@ function App() {
   useEffect(() => {
     const b = boards.find(
       (x) =>
-        x.port === selectedPort ||
         x.identity === ports.find((p) => p.port === selectedPort)?.identity,
     );
-    if (b)
-      setAssignment({
-        logical_name: b.logical_name,
-        role: b.role,
-        target: b.target,
-        geometry: b.geometry,
-      });
-  }, [selectedPort, boards]);
+    setAssignment({
+      logical_name: b?.logical_name || "",
+      role: b?.role || "csi_receiver",
+      target: b?.target || "esp32c3",
+      geometry: b?.geometry || "",
+    });
+  }, [selectedPort, boards, ports]);
   const submitJob = async (path: string, body: unknown) => {
     const j = await api(path, body);
     setSelectedJob(j.id);
@@ -318,9 +320,9 @@ function App() {
   };
   const config = () => {
     const s = boards.find((b) => b.identity === sender);
-    if (!s)
+    if (sender && !s)
       throw new Error(
-        "Assign and select a CSI sender in Hardware Setup first.",
+        "Selected sender registration was removed; refresh hardware.",
       );
     const selected = boards.filter(
       (b) => receivers.includes(b.identity) && b.role === "csi_receiver",
@@ -340,7 +342,7 @@ function App() {
       duration_seconds: form.duration_seconds
         ? Number(form.duration_seconds)
         : null,
-      sender: toReceiver(s),
+      sender: s ? toReceiver(s) : null,
       receivers: selected.map(toReceiver),
       camera,
     };
@@ -359,6 +361,13 @@ function App() {
   const inspectSession = async (sid: string) => {
     setDetail(await api(`/sessions/${sid}`));
     choosePage("Sessions");
+  };
+  const removeDevice = async (identity: string) => {
+    await api("/devices/remove", { identity });
+    setSender((old) => (old === identity ? "" : old));
+    setReceivers((old) => old.filter((x) => x !== identity));
+    setPreflight(null);
+    await refresh();
   };
   const selectCamera = (device: string) => {
     const selected = cameras.find((c) => c.device === device);
@@ -383,7 +392,7 @@ function App() {
       run(refresh);
     }
   }, [currentJob?.id, currentJob?.status]);
-  const cameraQuery = `token=${previewToken.current}&device=${encodeURIComponent(camera.device)}&width=${camera.width}&height=${camera.height}&fps=${camera.fps}`;
+  const cameraQuery = `token=${previewToken.current}&device=${encodeURIComponent(camera.device)}&width=${camera.width}&height=${camera.height}&fps=${camera.fps}&fixed_frame_rate=${camera.fixed_frame_rate}`;
   const changeForm = (key: string, value: string | number) => {
     setForm((old) => ({ ...old, [key]: value }));
     setPreflight(null);
@@ -657,6 +666,74 @@ function App() {
                   </Empty>
                 )}
               </section>
+              <section className="panel" aria-label="Registered logical names">
+                <div className="panel-heading">
+                  <h2>Registered logical names</h2>
+                  <span className="subtle">
+                    Connection status updates when you refresh hardware
+                  </span>
+                </div>
+                <p className="hint">
+                  Remove registration frees the logical name. Saved sessions and
+                  board firmware are kept.
+                </p>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Logical name</th>
+                        <th>Role / target</th>
+                        <th>Connection</th>
+                        <th>Port / USB identity</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {boards.map((b) => {
+                        const current = ports.find(
+                          (p) => p.identity === b.identity,
+                        );
+                        return (
+                          <tr key={b.identity}>
+                            <td>{b.logical_name}</td>
+                            <td>
+                              {b.role.replace("csi_", "")}
+                              <small>{b.target}</small>
+                            </td>
+                            <td>{current ? "Connected" : "Disconnected"}</td>
+                            <td>
+                              {current ? current.device : "No current port"}
+                              <small>
+                                {current
+                                  ? `Stable path: ${current.stable_path || current.port}`
+                                  : `Last registered: ${b.port}`}
+                              </small>
+                              <small>{b.identity}</small>
+                            </td>
+                            <td>
+                              <button
+                                disabled={busy || recording || hardwareBusy}
+                                aria-label={`Remove registration ${b.logical_name}`}
+                                onClick={() =>
+                                  run(() => removeDevice(b.identity))
+                                }
+                              >
+                                Remove registration
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                {!boards.length && (
+                  <Empty>
+                    No logical names registered yet. Select a connected board
+                    and save an assignment below.
+                  </Empty>
+                )}
+              </section>
               <div className="two-column">
                 <section className="panel">
                   <h2>Board configuration</h2>
@@ -787,6 +864,23 @@ function App() {
                       <option value="blink">Blink / Identify</option>
                     </select>
                   </Field>
+                  {flashChoice === "csi-recv" && (
+                    <Field label="CSI output connection">
+                      <select
+                        value={csiTransport}
+                        onChange={(e) => {
+                          setCsiTransport(e.target.value);
+                          setConfirmFlash(false);
+                        }}
+                      >
+                        <option value="auto">
+                          Automatic from selected serial connection
+                        </option>
+                        <option value="usb">Native USB Serial/JTAG</option>
+                        <option value="uart">USB-to-UART bridge</option>
+                      </select>
+                    </Field>
+                  )}
                   {flashChoice === "blink" && (
                     <div className="form-grid">
                       <Field label="LED type">
@@ -851,6 +945,7 @@ function App() {
                                   flashChoice === "blink" ? Number(gpio) : null,
                                 led_type: ledType,
                                 active_low: activeLow,
+                                csi_transport: csiTransport,
                               }),
                             )
                           }
@@ -973,6 +1068,24 @@ function App() {
                         Test camera
                       </button>
                     </div>
+                    {!camera.device.startsWith("phone://") && (
+                      <label className="checkbox">
+                        <input
+                          type="checkbox"
+                          checked={camera.fixed_frame_rate}
+                          onChange={(e) => {
+                            closePreview();
+                            setCamera({
+                              ...camera,
+                              fixed_frame_rate: e.target.checked,
+                            });
+                            setPreflight(null);
+                          }}
+                        />
+                        Keep requested FPS (disable exposure-driven frame rate
+                        reduction)
+                      </label>
+                    )}
                     <details>
                       <summary>Supported formats</summary>
                       <pre>
@@ -1059,7 +1172,7 @@ function App() {
                       </Field>
                     ))}
                     <h3>Hardware selection</h3>
-                    <Field label="CSI sender">
+                    <Field label="CSI sender (optional)">
                       <select
                         value={sender}
                         onChange={(e) => {
@@ -1067,16 +1180,26 @@ function App() {
                           setPreflight(null);
                         }}
                       >
-                        <option value="">Select sender</option>
+                        <option value="">
+                          External / battery-powered sender (no USB)
+                        </option>
                         {boards
                           .filter((b) => b.role === "csi_sender")
                           .map((b) => (
                             <option key={b.identity} value={b.identity}>
-                              {b.logical_name} · {b.port}
+                              {b.logical_name} ·{" "}
+                              {ports.find((p) => p.identity === b.identity)
+                                ?.device || "Disconnected"}
                             </option>
                           ))}
                       </select>
                     </Field>
+                    <p className="hint">
+                      Power the sender on before preflight. Receiver packet
+                      sequences and collector timestamps provide alignment; the
+                      sender needs no USB connection. Use the same WiFi channel
+                      on all boards.
+                    </p>
                     <div className="field">
                       <span>CSI receivers</span>
                       {boards
@@ -1099,7 +1222,10 @@ function App() {
                               }}
                             />
                             <strong>{b.logical_name}</strong>
-                            <small>{b.port}</small>
+                            <small>
+                              {ports.find((p) => p.identity === b.identity)
+                                ?.device || "Disconnected"}
+                            </small>
                           </label>
                         ))}
                       {!boards.some((b) => b.role === "csi_receiver") && (
@@ -1450,9 +1576,33 @@ function App() {
                           {number(currentJob.result.measured_fps)} FPS ·{" "}
                           {currentJob.result.frames} frames ·{" "}
                           {currentJob.result.resolution?.join(" × ")}
+                          {currentJob.result.requested_fps !== undefined &&
+                            ` · requested ${currentJob.result.requested_fps} FPS`}
                         </span>
                       )}
                     </div>
+                  )}
+                  {currentJob.kind === "camera-test" &&
+                    currentJob.result.diagnostics
+                      ?.dynamic_framerate_disabled && (
+                      <p className="hint">
+                        Exposure-driven frame rate reduction disabled; auto
+                        exposure stays enabled.
+                      </p>
+                    )}
+                  {currentJob.kind === "camera-test" &&
+                    currentJob.result.passed === false && (
+                      <p className="hint">{currentJob.result.rate_note}</p>
+                    )}
+                  {currentJob.result.transport?.firmware_layout ===
+                    "binary_v1" && (
+                    <p className="hint">
+                      Binary CSI ·{" "}
+                      {currentJob.result.transport.firmware_queue_drops || 0}{" "}
+                      firmware queue drops ·{" "}
+                      {currentJob.result.transport.firmware_invalid || 0}{" "}
+                      firmware input rejects during this test
+                    </p>
                   )}
                   <details open={currentJob.kind === "probe"}>
                     <summary>
@@ -1630,7 +1780,11 @@ function LiveStatus({ status }: { status: Json }) {
                       {r.sequence_gaps} / {r.backwards_or_resets}
                     </td>
                     <td>{r.parse_errors}</td>
-                    <td>{r.queue_drops}</td>
+                    <td>
+                      {r.queue_drops} host
+                      {r.firmware_queue_drops !== undefined &&
+                        ` / ${r.firmware_queue_drops} firmware`}
+                    </td>
                   </tr>
                 ))}
               </tbody>

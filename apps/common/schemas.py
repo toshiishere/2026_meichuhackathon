@@ -35,6 +35,7 @@ class CameraConfig(Strict):
         pattern=r"^(?:/dev/video[0-9]+|phone://[a-f0-9]{32}|synthetic://camera)$",
     )
     fps: int = Field(default=DEFAULTS["camera_fps"], ge=1, le=120)
+    fixed_frame_rate: bool = True
     width: int = Field(default=DEFAULTS["camera_width"], ge=160, le=3840)
     height: int = Field(default=DEFAULTS["camera_height"], ge=120, le=2160)
     geometry: str = Field(default="", max_length=4000)
@@ -55,7 +56,7 @@ class CollectionConfig(Strict):
     activity_script: str = Field(default="", max_length=4000)
     notes: str = Field(default="", max_length=8000)
     layout_notes: str = Field(default="", max_length=4000)
-    sender: Receiver
+    sender: Receiver | None = None
     receivers: list[Receiver] = Field(min_length=1, max_length=8)
     camera: CameraConfig
     baud_rate: int = Field(default=DEFAULTS["baud_rate"], ge=9600, le=3000000)
@@ -67,8 +68,9 @@ class CollectionConfig(Strict):
 
     @model_validator(mode="after")
     def unique_devices(self):
-        names = [x.logical_name for x in [self.sender, *self.receivers]]
-        ports = [x.port for x in [self.sender, *self.receivers]]
+        devices = ([self.sender] if self.sender else []) + self.receivers
+        names = [x.logical_name for x in devices]
+        ports = [x.port for x in devices]
         if len(set(names)) != len(names) or len(set(ports)) != len(ports):
             raise ValueError("Each sender/receiver needs a unique name and port")
         return self
@@ -90,6 +92,7 @@ class FlashRequest(Strict):
     gpio: int | None = Field(default=None, ge=0, le=48)
     led_type: Literal["gpio", "rgb", "none"] = "gpio"
     active_low: bool = False
+    csi_transport: Literal["auto", "usb", "uart"] = "auto"
 
 
 class PhonePairRequest(Strict):
@@ -101,3 +104,7 @@ class PhonePairRequest(Strict):
 
 class RemoveSessionRequest(Strict):
     confirm_session_id: str = Field(pattern=ID)
+
+
+class RemoveDeviceRequest(Strict):
+    identity: str = Field(min_length=1, max_length=300)

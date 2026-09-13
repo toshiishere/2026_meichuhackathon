@@ -65,3 +65,78 @@ Physical Android/iOS camera capture and certificate installation have not been
 verified on a handset. Browser tests bypass certificate errors in their isolated
 context; an actual phone must trust the lab CA. Arrival timestamps do not measure
 or correct phone sensor, JPEG, or network latency.
+
+## CSI throughput and camera correction (2026-09-13)
+
+The recorded camera failures were `/dev/video0` (Logitech C270), 1280 × 720,
+70 frames over a five-second test, approximately 15.0 FPS. V4L2 reported MJPG at
+30 FPS, auto exposure in aperture-priority mode, and
+`exposure_dynamic_framerate=1`. Disabling that control produced 140 frames and
+29.58 FPS in the same test, with auto exposure still enabled. This is the control
+that allows automatic exposure to vary FPS, per the [Linux camera control
+reference](https://kernel.org/doc/html/v5.7/media/uapi/v4l/ext-ctrls-camera.html).
+The collector now applies the fixed-frame-rate setting by default, exposes it in
+the UI, and includes the negotiated mode and control results in diagnostics.
+The C270's metadata-only `/dev/video1` is no longer offered as a camera.
+
+Historical receiver tests showed about 65–66 packets/second, approximately
+90–100 sequence gaps per five-second test, and hundreds of gain-log lines. A
+representative CSV record was 1343 characters. The old callback formatted and
+printed every sample and gain line inside the Wi-Fi task. The patch queues
+unmodified CSI bytes for a worker and sends a 450-byte binary packet for 384
+samples; host reads now operate on chunks. The sender's relative sleep was also
+replaced with a periodic schedule. These remove identifiable software costs;
+they are not a measured claim of 100 Hz over the physical radio.
+
+Validation:
+
+- 50 Python tests pass (two opt-in physical-device tests excluded), including
+  raw binary metadata/sample/CRC preservation, chunk-boundary framing, corrupt
+  frame recovery, bounded noise handling, 100 Hz pseudoterminal ingestion,
+  synchronized binary CSI/video recording, firmware loss accounting, camera
+  control application, and build-cache exclusion of generated files.
+- A native C emitter using the firmware header produced exactly the same packet
+  bytes and CRC as the independent Python packet fixture/decoder.
+- ESP-IDF 5.5 compiled the queued/buffered binary receiver for ESP32, ESP32-C3,
+  ESP32-C6, and ESP32-S3, and the periodic sender for ESP32.
+- Frontend TypeScript and production Docker images build successfully. Both
+  full-stack Chrome regressions pass: collection/playback and HTTPS phone
+  pairing/recording/removal, using separate synthetic test data.
+- The deployed app was tested in Chrome against the attached C270: **29.80 FPS,
+  141 frames, 1280 × 720 MJPG**, requested/negotiated 30 FPS, PASS, no browser
+  errors. The fixed-frame-rate checkbox and diagnostic result were verified.
+- All three deployed services are healthy in real mode; running Python source
+  matches the workspace. Checksums of all eight existing raw artifacts match
+  their pre-update values.
+
+Blink was explicitly excluded from this update. No board was flashed during these
+checks. The receiver and sender changes take effect after the corresponding
+firmware is installed through Hardware Setup. Camera correction was measured on
+the attached webcam; firmware radio-rate improvements require a post-flash test.
+
+### Follow-up: direct transport, external sender, and device registrations
+
+The queued binary firmware still showed a USB output bottleneck: job
+`ab7a99174c9141e68baebb3bda760d27` received 314 packets in 5.020 seconds
+(62.55 Hz), with 97 firmware queue drops and no parse errors. The worker's
+`fwrite` still used per-byte console VFS dispatch. Following the direct USB
+driver approach in the pinned reference linked in [the transport document](csi-binary-v1.md),
+frames now go directly to the selected USB/UART driver, with explicit short-write
+retries and no mirrored runtime console output. The target stays at 100 Hz.
+
+- ESP-IDF 5.5 builds pass for ESP32 UART, ESP32-C3 USB and UART, ESP32-C6 USB,
+  and ESP32-S3 USB. Native C tests verify whole-frame writes and partial-write /
+  backpressure recovery without interleaving frames.
+- 59 Python tests pass (two physical-device tests excluded). New coverage checks
+  receiver-only preflight, optional-sender multi-receiver/video timestamps,
+  explicit sender identity validation, transport selection/cache configuration,
+  and device-registration removal while retaining archived files.
+- Three full-stack Chrome tests pass against isolated synthetic data: collection
+  with no sender selected, HTTPS phone collection and session removal, and logical
+  name mapping through port changes/disconnection/removal.
+
+Sender selection now defaults to external power. Registered logical names show
+current connections by USB identity; removal affects registration metadata only.
+No ESP32 was connected at the end of validation, so the direct-output firmware
+has not been flashed or physically rate-tested in this follow-up. The compiled
+C3 native-USB cache key is `15e7fe4811b919db2369bb82`.

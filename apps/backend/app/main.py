@@ -7,7 +7,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from apps.common.config import DATA
-from apps.common.schemas import Device, ID, RemoveSessionRequest
+from apps.common.schemas import Device, ID, RemoveSessionRequest, RemoveDeviceRequest
 from apps.common.storage import Registry, scan_sessions, read_session, rebuild_manifest
 
 HARDWARE = os.getenv("HARDWARE_URL", "http://hardware-service:8001")
@@ -107,6 +107,16 @@ async def save_device(device: Device):
     value["firmware"] = old.get("firmware", {}) if old else {}
     registry.put("devices", device.identity, value)
     return value
+
+
+@app.post("/api/devices/remove")
+def remove_device(request: RemoveDeviceRequest):
+    if registry.get("devices", request.identity) is None:
+        raise HTTPException(404, "Device registration not found")
+    # Recordings retain their own configuration snapshots; removing a name does
+    # not touch those snapshots, open serial connections, or board firmware.
+    registry.delete("devices", request.identity)
+    return {"identity": request.identity, "removed": True}
 
 
 @app.get("/api/sessions")

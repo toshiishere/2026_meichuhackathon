@@ -1,7 +1,9 @@
 import glob
+from collections import deque
 import math
 import random
 import re
+import subprocess
 import time
 from pathlib import Path
 import cv2
@@ -10,6 +12,7 @@ import serial
 from serial.tools import list_ports
 from apps.common.config import MODE, DEFAULTS
 from .csi import LEGACY
+from .csi_wire import SerialFramer
 from .phone import hub, PhoneCameraSource
 
 
@@ -108,6 +111,9 @@ def cameras():
                 timeout=5,
             )
             details = formats.stdout or formats.stderr
+            # Metadata-only UVC nodes (e.g. video1 on a C270) are not cameras.
+            if formats.returncode == 0 and not re.search(r"\[\d+\]:", details):
+                continue
         except (OSError, subprocess.TimeoutExpired) as e:
             details = str(e)
         result.append(
@@ -128,8 +134,9 @@ class SerialSource:
         self.rate, self.loss = rate, loss
         self.random = random.Random(seed)
         self.handle = None
-        self.buffer = bytearray()
-        self.discarding = False
+        self.framer = SerialFramer(DEFAULTS["max_serial_line_bytes"])
+        self.buffer = self.framer.buffer
+        self.pending = deque()
         if not self.synthetic:
             # Avoid deliberate DTR/RTS resets during collection. Some USB drivers
             # may still pulse lines on open: preflight checks actual arrival.
@@ -153,7 +160,7 @@ class SerialSource:
         self.start_ns = start_ns
         self.next_seq = 0
         self.buffer.clear()
-        self.discarding = False
+        self.pending.clear()
         if self.handle:
             self.handle.reset_input_buffer()
 
@@ -195,25 +202,20 @@ class SerialSource:
                 ",".join(str(values[k]) for k in LEGACY).encode(),
                 time.monotonic_ns(),
             )
-        chunk = self.handle.read_until(b"\n", size=DEFAULTS["max_serial_line_bytes"])
-        timestamp = time.monotonic_ns()
-        if not chunk:
-            return None
-        if self.discarding:
-            if chunk.endswith(b"\n"):
-                self.discarding = False
-            return None
-        self.buffer.extend(chunk)
-        if len(self.buffer) > DEFAULTS["max_serial_line_bytes"]:
-            bad = bytes(self.buffer)
-            self.buffer.clear()
-            self.discarding = not chunk.endswith(b"\n")
-            return bad, timestamp
-        if not chunk.endswith(b"\n"):
-            return None
-        line = bytes(self.buffer)
-        self.buffer.clear()
-        return line.rstrip(b"\r\n"), timestamp
+        if self.pending:
+            return self.pending.popleft()
+        deadline = time.monotonic() + DEFAULTS["serial_timeout_seconds"]
+        while not stop.is_set():
+            chunk = self.handle.read(max(1, min(self.handle.in_waiting, 8192)))
+            timestamp = time.monotonic_ns()
+            if not chunk:
+                return None
+            self.pending.extend(self.framer.feed(chunk, timestamp))
+            if self.pending:
+                return self.pending.popleft()
+            if time.monotonic() >= deadline:
+                return None
+        return None
 
     def close(self):
         if self.handle:
@@ -232,6 +234,10 @@ class CameraSource:
         if self.synthetic != (config.device == "synthetic://camera"):
             raise ValueError("Camera device does not match hardware mode")
         self.handle = None
+        self.diagnostics = {
+            "requested_fps": config.fps,
+            "fixed_frame_rate": config.fixed_frame_rate,
+        }
         self.index = 0
         self.next_frame = time.monotonic()
         if not self.synthetic:
@@ -248,6 +254,52 @@ class CameraSource:
                 self.handle.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
                 self.handle.set(cv2.CAP_PROP_FPS, config.fps)
                 self.handle.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                controls = subprocess.run(
+                    ["v4l2-ctl", "-d", config.device, "--list-ctrls"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.diagnostics["controls_before"] = controls.stdout or controls.stderr
+                dynamic = next(
+                    (
+                        name
+                        for name in (
+                            "exposure_dynamic_framerate",
+                            "exposure_auto_priority",
+                        )
+                        if re.search(r"\b" + name + r"\b", controls.stdout)
+                    ),
+                    None,
+                )
+                if dynamic:
+                    applied = subprocess.run(
+                        [
+                            "v4l2-ctl",
+                            "-d",
+                            config.device,
+                            f"--set-ctrl={dynamic}={0 if config.fixed_frame_rate else 1}",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.diagnostics["dynamic_framerate_disabled"] = (
+                        applied.returncode == 0 and config.fixed_frame_rate
+                    )
+                    if applied.returncode:
+                        self.diagnostics["control_error"] = applied.stderr.strip()
+                self.diagnostics.update(
+                    negotiated_fps=self.handle.get(cv2.CAP_PROP_FPS),
+                    negotiated_resolution=[
+                        int(self.handle.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                        int(self.handle.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                    ],
+                    pixel_format="".join(
+                        chr((int(self.handle.get(cv2.CAP_PROP_FOURCC)) >> 8 * i) & 255)
+                        for i in range(4)
+                    ),
+                )
             except Exception:
                 self.close()
                 raise

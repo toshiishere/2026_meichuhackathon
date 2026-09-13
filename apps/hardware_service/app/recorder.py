@@ -19,7 +19,7 @@ import zstandard as zstd
 
 from apps.common.config import DEFAULTS, MODE, ROOT, SCHEMA_VERSION
 from apps.common.storage import atomic_json, utc_now, rebuild_manifest
-from .csi import FIELDS, GAIN, SequenceTracker, parse_csi
+from .csi import FIELDS, GAIN, SequenceTracker, TransportTracker, parse_csi
 from .sources import SerialSource, CameraSource
 
 FRAME_SCHEMA = pa.schema(
@@ -137,6 +137,7 @@ class Recorder:
         name = receiver.logical_name
         last_rate_time, rate_count = time.monotonic(), 0
         pending_gain = {}
+        transport_tracker = TransportTracker()
         try:
             while not self.stop.is_set():
                 value = source.read(self.stop)
@@ -149,14 +150,18 @@ class Recorder:
                 line = raw.decode("utf-8", errors="replace")
                 record, rejection = None, None
                 try:
-                    record = parse_csi(line)
+                    record = parse_csi(raw)
                     if record:
                         record.update(
                             host_timestamp_ns=stamp,
                             wall_timestamp_utc=wall,
                             receiver_id=name,
                             port=receiver.port,
-                            **pending_gain,
+                            **(
+                                pending_gain
+                                if record["firmware_layout"] != "binary_v1"
+                                else {}
+                            ),
                         )
                         pending_gain = {}
                     else:
@@ -182,6 +187,14 @@ class Recorder:
                         s["last_timestamp_ns"] = stamp
                         s["rssi"] = record["rssi"]
                         self.trackers[name].update(record["tx_seq"])
+                        s.update(transport_tracker.update(record))
+                        for key in (
+                            "firmware_received_total",
+                            "firmware_queue_drops_total",
+                            "firmware_invalid_total",
+                        ):
+                            if key in record:
+                                s[key] = record[key]
                     elif rejection:
                         s["parse_errors"] += 1
                     else:
@@ -391,7 +404,8 @@ class Recorder:
             configuration=self.config.model_dump(),
             clock={
                 "source": "time.monotonic_ns",
-                "csi_timestamp": "complete serial line receipt",
+                "csi_timestamp": "host serial chunk receipt containing the complete CSV line or CRC-checked binary frame",
+                "csi_transport": "CSV or binary v1; binary rows retain raw int8 samples and gain metadata without compensation",
                 "camera_timestamp": (
                     "phone frame websocket arrival on collector"
                     if self.config.camera.device.startswith("phone://")
@@ -436,10 +450,7 @@ class Recorder:
                     sample = source.read(self.stop)
                     if sample:
                         try:
-                            serial_ready = (
-                                parse_csi(sample[0].decode(errors="replace"))
-                                is not None
-                            )
+                            serial_ready = parse_csi(sample[0]) is not None
                         except ValueError:
                             continue
                         if serial_ready:
@@ -465,6 +476,7 @@ class Recorder:
                     producer=True,
                 )
             camera = CameraSource(self.config.camera)
+            metadata["camera_diagnostics"] = getattr(camera, "diagnostics", {})
             self.sources.append(camera)
             # A successful camera read and open encoder are prerequisites to the start gate.
             warmup = camera.read(self.stop)
@@ -599,6 +611,8 @@ class Recorder:
             degraded = (
                 any(
                     s["queue_drops"]
+                    or s.get("firmware_queue_drops", 0)
+                    or s.get("firmware_invalid", 0)
                     or s["parse_errors"]
                     or self.trackers[n].gaps
                     or self.trackers[n].backwards

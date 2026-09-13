@@ -25,6 +25,15 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_csi_gain_ctrl.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+#if CONFIG_CSI_OUTPUT_USB
+#include "driver/usb_serial_jtag.h"
+#endif
+#include "csi_wire.h"
+#include "csi_output.h"
 
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   11
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
@@ -134,79 +143,158 @@ static void wifi_esp_now_init(esp_now_peer_info_t peer)
 
 }
 
+typedef struct {
+    wifi_pkt_rx_ctrl_t rx_ctrl;
+    csi_wire_meta_t meta;
+    int8_t samples[CSI_MAX_SAMPLES];
+} queued_csi_t;
+static queued_csi_t *slots;
+static QueueHandle_t free_slots, ready_slots;
+
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
-    if (!info || !info->buf) {
-        ESP_LOGW(TAG, "<%s> wifi_csi_cb", esp_err_to_name(ESP_ERR_INVALID_ARG));
+    /* Wi-Fi task: no printing, allocation, blocking, or sample conversion. */
+    static uint32_t received_total, queue_drops, invalid_total;
+    if (!info || memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6)) return;
+    ++received_total;
+    if (!info->buf || !info->payload || info->payload_len < 19 ||
+        !info->len || info->len > CSI_MAX_SAMPLES || (info->len & 1)) {
+        ++invalid_total;
         return;
     }
-
-    if (memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6)) {
+    uint8_t index;
+    if (xQueueReceive(free_slots, &index, 0) != pdTRUE) {
+        ++queue_drops;
         return;
     }
+    queued_csi_t *item = &slots[index];
+    memset(&item->meta, 0, sizeof(item->meta));
+    item->rx_ctrl = info->rx_ctrl;
+    memcpy(item->meta.mac, info->mac, 6);
+    /* ESP-NOW vendor payload offset used by the original firmware; avoid an
+       unaligned uint32 dereference and reject short payloads before accessing. */
+    memcpy(&item->meta.tx_seq, info->payload + 15, sizeof(uint32_t));
+    item->meta.received_total = received_total;
+    item->meta.queue_drops = queue_drops;
+    item->meta.invalid_total = invalid_total;
+    item->meta.len = info->len;
+    item->meta.first_word = info->first_word_invalid;
+    memcpy(item->samples, info->buf, info->len);
+    if (xQueueSend(ready_slots, &index, 0) != pdTRUE) {
+        ++queue_drops;
+        xQueueSend(free_slots, &index, 0);
+    }
+}
 
-    const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
-    static int s_count = 0;
-    float compensate_gain = 1.0f;
-    static uint8_t agc_gain = 0;
-    static int8_t fft_gain = 0;
+/* Bulk driver writes follow the direct USB output path used by
+ * TryTwoTop/esp32c5-csi-keystroke (8999ce8379266d5efb8b7cb3e73e6bdcd1db323d).
+ * Retain our CRC protocol and handle short/zero writes instead of discarding them. */
+static int csi_transport_write(const uint8_t *data, size_t size)
+{
+#if CONFIG_CSI_OUTPUT_USB
+    return usb_serial_jtag_write_bytes(data, size, pdMS_TO_TICKS(20));
+#else
+    return uart_write_bytes(CONFIG_ESP_CONSOLE_UART_NUM, data, size);
+#endif
+}
+
+static void csi_transport_wait(void)
+{
+    vTaskDelay(1);
+}
+
+static void csi_output_task(void *arg)
+{
+    uint8_t wire[7 + sizeof(csi_wire_meta_t) + CSI_MAX_SAMPLES + 4];
+    uint32_t calibrated = 0;
+    while (true) {
+        uint8_t index;
+        xQueueReceive(ready_slots, &index, portMAX_DELAY);
+        queued_csi_t *item = &slots[index];
+        csi_wire_meta_t *m = &item->meta;
+        const wifi_pkt_rx_ctrl_t *rx = &item->rx_ctrl;
+        m->rssi = rx->rssi;
+        m->rate = rx->rate;
+        m->noise_floor = rx->noise_floor;
+        m->channel = rx->channel;
+        m->local_timestamp = rx->timestamp;
+        m->sig_len = rx->sig_len;
+        m->compensate_gain = 1.0f;
 #if CONFIG_GAIN_CONTROL
-    static uint8_t agc_gain_baseline = 0;
-    static int8_t fft_gain_baseline = 0;
-    esp_csi_gain_ctrl_get_rx_gain(rx_ctrl, &agc_gain, &fft_gain);
-    if (s_count < 100) {
-        esp_csi_gain_ctrl_record_rx_gain(agc_gain, fft_gain);
-    } else if (s_count == 100) {
-        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_gain_baseline, &fft_gain_baseline);
+        uint8_t agc = 0;
+        int8_t fft = 0;
+        float compensation = 1.0f;
+        esp_csi_gain_ctrl_get_rx_gain(rx, &agc, &fft);
+        if (calibrated < 100) esp_csi_gain_ctrl_record_rx_gain(agc, fft);
+        else if (calibrated == 100) {
+            uint8_t agc_baseline;
+            int8_t fft_baseline;
+            esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_baseline, &fft_baseline);
 #if CONFIG_FORCE_GAIN
-        esp_csi_gain_ctrl_set_rx_force_gain(agc_gain_baseline, fft_gain_baseline);
-        ESP_LOGD(TAG, "fft_force %d, agc_force %d", fft_gain_baseline, agc_gain_baseline);
+            esp_csi_gain_ctrl_set_rx_force_gain(agc_baseline, fft_baseline);
 #endif
-    }
-    esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
-    ESP_LOGI(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
+        }
+        esp_csi_gain_ctrl_get_gain_compensation(&compensation, agc, fft);
+        m->agc_gain = agc;
+        m->fft_gain = fft;
+        m->compensate_gain = compensation;
 #endif
-
-    uint32_t rx_id = *(uint32_t *)(info->payload + 15);
+        ++calibrated;
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
-    if (!s_count) {
-        ESP_LOGI(TAG, "================ CSI RECV ================");
-        ets_printf("type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,channel,local_timestamp,sig_len,rx_format,len,first_word,data\n");
-    }
-
-    ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d",
-               rx_id, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate,
-               rx_ctrl->noise_floor, fft_gain, agc_gain,  rx_ctrl->channel,
-               rx_ctrl->timestamp, rx_ctrl->sig_len, rx_ctrl->cur_bb_format);
+        m->layout = 1;
+        m->rx_format = rx->cur_bb_format;
 #else
-    if (!s_count) {
-        ESP_LOGI(TAG, "================ CSI RECV ================");
-        ets_printf("type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_format,len,first_word,data\n");
-    }
-
-    ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-               rx_id, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate, rx_ctrl->sig_mode,
-               rx_ctrl->mcs, rx_ctrl->cwb, rx_ctrl->smoothing, rx_ctrl->not_sounding,
-               rx_ctrl->aggregation, rx_ctrl->stbc, rx_ctrl->fec_coding, rx_ctrl->sgi,
-               rx_ctrl->noise_floor, rx_ctrl->ampdu_cnt, rx_ctrl->channel, rx_ctrl->secondary_channel,
-               rx_ctrl->timestamp, rx_ctrl->ant, rx_ctrl->sig_len, rx_ctrl->sig_mode);
-
+        m->sig_mode = rx->sig_mode;
+        m->mcs = rx->mcs;
+        m->bandwidth = rx->cwb;
+        m->smoothing = rx->smoothing;
+        m->not_sounding = rx->not_sounding;
+        m->aggregation = rx->aggregation;
+        m->stbc = rx->stbc;
+        m->fec_coding = rx->fec_coding;
+        m->sgi = rx->sgi;
+        m->ampdu_cnt = rx->ampdu_cnt;
+        m->secondary_channel = rx->secondary_channel;
+        m->ant = rx->ant;
+        m->rx_format = rx->sig_mode;
 #endif
-#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
-    int16_t csi = ((int16_t)(((((uint16_t)info->buf[1]) << 8) | info->buf[0]) << 4) >> 4);
-    ets_printf(",%d,%d,\"[%d", (info->len - 2) / 2, info->first_word_invalid, (int16_t)(compensate_gain * csi));
-    for (int i = 2; i < (info->len - 2); i += 2) {
-        csi = ((int16_t)(((((uint16_t)info->buf[i + 1]) << 8) | info->buf[i]) << 4) >> 4);
-        ets_printf(",%d", (int16_t)(compensate_gain * csi));
+        uint16_t body_len = sizeof(*m) + m->len;
+        memcpy(wire, CSI_MAGIC, 4);
+        wire[4] = CSI_WIRE_VERSION;
+        memcpy(wire + 5, &body_len, 2);
+        memcpy(wire + 7, m, sizeof(*m));
+        memcpy(wire + 7 + sizeof(*m), item->samples, m->len);
+        uint32_t crc = csi_crc32(wire + 4, 3 + body_len);
+        memcpy(wire + 7 + body_len, &crc, 4);
+        csi_write_complete(wire, 11 + body_len, csi_transport_write, csi_transport_wait);
+        xQueueSend(free_slots, &index, portMAX_DELAY);
     }
+}
+
+static void csi_output_init(void)
+{
+    slots = calloc(CSI_QUEUE_DEPTH, sizeof(*slots));
+    free_slots = xQueueCreate(CSI_QUEUE_DEPTH, sizeof(uint8_t));
+    ready_slots = xQueueCreate(CSI_QUEUE_DEPTH, sizeof(uint8_t));
+    ESP_ERROR_CHECK(slots && free_slots && ready_slots ? ESP_OK : ESP_ERR_NO_MEM);
+    for (uint8_t i = 0; i < CSI_QUEUE_DEPTH; ++i) xQueueSend(free_slots, &i, 0);
+#if CONFIG_CSI_OUTPUT_USB
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t usb_config = {.tx_buffer_size = 8192, .rx_buffer_size = 256};
+        ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_config));
+    }
+    ESP_LOGI(TAG, "CSI binary v1: direct USB Serial/JTAG, %d slots", CSI_QUEUE_DEPTH);
 #else
-    ets_printf(",%d,%d,\"[%d", info->len, info->first_word_invalid, (int16_t)(compensate_gain * info->buf[0]));
-    for (int i = 1; i < info->len; i++) {
-        ets_printf(",%d", (int16_t)(compensate_gain * info->buf[i]));
+    if (!uart_is_driver_installed(CONFIG_ESP_CONSOLE_UART_NUM)) {
+        ESP_ERROR_CHECK(uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 8192, 0, NULL, 0));
     }
+    ESP_LOGI(TAG, "CSI binary v1: direct UART%d at %d baud, %d slots",
+             CONFIG_ESP_CONSOLE_UART_NUM, CONFIG_ESP_CONSOLE_UART_BAUDRATE, CSI_QUEUE_DEPTH);
 #endif
-    ets_printf("]\"\n");
-    s_count++;
+    /* Runtime console logs must not interleave with direct binary writes.
+       Boot/startup logs remain visible; per-frame metadata carries diagnostics. */
+    esp_log_level_set("*", ESP_LOG_NONE);
+    ESP_ERROR_CHECK(xTaskCreate(csi_output_task, "csi_output", 4096, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
 
 static void wifi_csi_init()
@@ -293,5 +381,6 @@ void app_main()
 
     wifi_esp_now_init(peer);
 
+    csi_output_init();
     wifi_csi_init();
 }

@@ -12,7 +12,9 @@ are canonical; the session index and root Parquet manifest are rebuildable.
 The collector uses one serial acquisition thread and bounded queue per receiver,
 one camera acquisition thread and bounded queue, separate streaming file writers,
 and one shared monotonic start gate. Readers timestamp at complete serial-line
-receipt / successful camera read, before queueing. The host clock synchronizes
+receipt / successful camera read, before queueing. Binary CSI is timestamped at
+receipt of the host serial chunk completing the frame; firmware acquisition time
+is retained separately. The host clock synchronizes
 modalities; transmitter sequence numbers synchronize receivers. USB buffering and
 camera driver latency remain measurement limitations, not corrected estimates.
 
@@ -61,3 +63,22 @@ recordings, atomically moves the directory out of the archive into
 `app/removing_sessions`, then deletes it and rebuilds the manifest. If cleanup
 fails, remaining files stay there for manual recovery and the job records failure.
 The backend prunes removed session index entries when the archive is refreshed.
+
+The 2026-09-13 firmware patches add a fixed-pool CSI callback queue, a lower-priority
+binary output task, direct bulk USB/UART driver output, and a periodic sender schedule. The
+collector accepts old CSV and new CRC-protected binary frames in the same framing
+layer. Raw binary frames are retained alongside decoded metadata and original int8
+samples. See [wire format and loss accounting](csi-binary-v1.md).
+
+Sender selection is optional: battery-powered transmitters do not need USB.
+Preflight validates any explicitly selected sender's USB identity; all modes
+require actual CSI arrival from each receiver. Receiver sequence alignment and
+host monotonic timestamps are unchanged. A session stores a null sender when
+external power is selected. Device registrations can be removed independently
+of historical session configuration snapshots. The web list joins registrations
+to current serial discovery by identity and labels stale port information.
+
+USB capture disables exposure-driven dynamic frame rates by default, keeping auto
+exposure enabled. The option applies to preview, tests, and recording. Negotiated
+FPS, dimensions, pixel format, and exposure controls are included in diagnostics;
+metadata-only UVC device nodes are omitted from camera discovery.

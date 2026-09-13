@@ -14,7 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "nvs_flash.h"
 
@@ -159,12 +160,19 @@ void app_main()
     ESP_LOGI(TAG, "wifi_channel: %d, send_frequency: %d, mac: " MACSTR,
              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, MAC2STR(CONFIG_CSI_SEND_MAC));
 
+    const TickType_t period = pdMS_TO_TICKS(1000 / CONFIG_SEND_FREQUENCY);
+    configASSERT(period > 0);
+    TickType_t next_send = xTaskGetTickCount();
     for (uint32_t count = 0; ; ++count) {
         esp_err_t ret = esp_now_send(peer.peer_addr, (const uint8_t *)&count, sizeof(count));
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 
-        usleep(1000 * 1000 / CONFIG_SEND_FREQUENCY);
+        /* Keep a periodic schedule: relative sleep adds send overhead to every
+           interval. Reset after an overrun instead of sending catch-up bursts. */
+        if (xTaskDelayUntil(&next_send, period) != pdTRUE) {
+            next_send = xTaskGetTickCount();
+        }
     }
 }

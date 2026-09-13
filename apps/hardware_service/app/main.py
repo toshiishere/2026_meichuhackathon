@@ -115,8 +115,20 @@ def test_camera(body: CameraConfig):
 
 
 @app.get("/camera/snapshot")
-def snapshot(device: str, width: int = 1280, height: int = 720, fps: int = 30):
-    config = CameraConfig(device=device, width=width, height=height, fps=fps)
+def snapshot(
+    device: str,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 30,
+    fixed_frame_rate: bool = True,
+):
+    config = CameraConfig(
+        device=device,
+        width=width,
+        height=height,
+        fps=fps,
+        fixed_frame_rate=fixed_frame_rate,
+    )
     jobs.acquire()
     try:
         source = CameraSource(config)
@@ -141,13 +153,24 @@ def snapshot(device: str, width: int = 1280, height: int = 720, fps: int = 30):
 
 @app.get("/camera/stream")
 async def stream(
-    device: str, token: str, width: int = 1280, height: int = 720, fps: int = 30
+    device: str,
+    token: str,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 30,
+    fixed_frame_rate: bool = True,
 ):
     global preview_token, preview_stop
     import uuid
 
     uuid.UUID(token)
-    config = CameraConfig(device=device, width=width, height=height, fps=fps)
+    config = CameraConfig(
+        device=device,
+        width=width,
+        height=height,
+        fps=fps,
+        fixed_frame_rate=fixed_frame_rate,
+    )
     jobs.acquire()
     try:
         source = await asyncio.to_thread(CameraSource, config)

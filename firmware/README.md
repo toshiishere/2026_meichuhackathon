@@ -1,14 +1,17 @@
-# Preserved working firmware
+# Firmware baseline and collection patches
 
 Before implementation the local `/home/toshi/esp-csi` tree was inspected read-only.
 Upstream commit: **8633d67152db2808f141cc1595970aa9cf406045**.
 The local top-level `csi_send`, `csi_recv` and `blink` projects were untracked
-working copies in that repository. Both CSI `main/app_main.c` files match
+working copies in that repository. Before the 2026-09-13 patches, both CSI `main/app_main.c` files matched
 `examples/get-started` at that commit. Full SDK configurations and dependency lock
 files are retained; build products and downloaded managed components are excluded.
 
 `provenance.json` records SHA-256 for all preserved files. Original source and boards
-were not modified by this project implementation. There are currently no patches.
+were not modified during the original implementation. The vendored receiver now
+uses queued binary output, and the sender uses a periodic schedule. See the
+[transport specification and installation steps](../docs/csi-binary-v1.md).
+The recorded upstream hashes remain the original baseline. Blink is unchanged.
 
 | Setting | Preserved value |
 |---|---|
@@ -22,11 +25,11 @@ were not modified by this project implementation. There are currently no patches
 | Receiver serial | 921600 baud |
 | TX sequence | uint32 counter carried in ESP-NOW payload |
 
-The receiver reads the transmitted counter and prints it as `id` or `seq`, depending
-on target. The collector preserves the original field and canonical unsigned
-`tx_seq`, since the firmware formats the uint32 value using `%d`. ESP local time
-is similarly preserved and exposed unsigned. Raw CSI is emitted as imaginary/real
-pairs. Gain compensation may produce values outside int8; the host retains int16.
+The updated receiver preserves original int8 CSI samples and gain metadata in
+CRC-protected binary records. The host also accepts the original CSV firmware,
+whose sample values were gain-compensated int16. The stored representation is
+explicit in each new CSV row, and the original binary frame or CSV line is retained.
+TX sequences and ESP local timestamps remain uint32 values.
 
 Building for the original target preserves the saved full SDK config. Selecting a
 different target uses the project's `sdkconfig.defaults`; it is a distinct build
