@@ -1,4 +1,4 @@
-# CSI Collection Lab
+# CSI Collection Lab 
 
 A Docker-first web application for **synchronized WiFi CSI and USB or phone camera collection**.
 Configure ESP32 boards, verify receiver/camera health, record multiple receivers
