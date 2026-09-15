@@ -258,6 +258,18 @@ tracked job and cannot be cancelled after it starts.
 
 ## Data layout
 
+Convert a saved CSI recording or raw binary capture to readable CSV and print
+the first 10 lines (including the header):
+
+```bash
+python3 scripts/convert_csi.py path/to/csi_receiver.csv.zst -o readable.csv
+python3 scripts/convert_csi.py path/to/capture.bin -o readable_binary.csv
+```
+
+The source stays unchanged. `.zst` input uses the `zstd` command or Python's
+`zstandard` package; raw binary input uses the existing CRC-checked decoder.
+See [conversion options](docs/csi-binary-v1.md#convert-an-existing-capture-to-readable-csv).
+
 ```text
 data/
   manifest.parquet                 # rebuildable session index

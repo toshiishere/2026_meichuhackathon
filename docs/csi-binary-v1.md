@@ -88,6 +88,31 @@ separately from host queue losses and transmitter sequence gaps. Counter resets
 are reported without inventing huge losses. Firmware queue loss during recording
 marks quality degraded; no missing packet is filled in.
 
+## Convert an existing capture to readable CSV
+
+From the repository root:
+
+```bash
+python3 scripts/convert_csi.py path/to/csi_receiver.csv.zst -o readable.csv
+# Raw binary serial capture, optionally containing boot log lines:
+python3 scripts/convert_csi.py path/to/capture.bin -o readable_binary.csv
+```
+
+The complete conversion is saved to CSV and its first **10 physical lines,
+including the header**, are printed to stdout. Progress goes to stderr.
+Use `--preview-lines 20` to change the preview length, or `0` to suppress it.
+Without `-o`, output is named after the input in the current directory. Existing
+output files are never overwritten. Conversion streams the input, preserves all
+samples and recorded metadata, and does not modify the source.
+
+Session `.csv.zst` files already contain decoded samples; these are decompressed
+to CSV. Raw binary v1 captures are decoded with length and CRC validation; corrupt
+or truncated frames fail conversion without publishing a partial output. Raw
+binary captures have no host timestamps, so those CSV columns remain empty.
+For compressed inputs, install either the `zstd` command or the Python
+`zstandard` package. Raw binary conversion needs only Python's standard library
+and this repository. `--input-format csv` or `binary` overrides auto-detection.
+
 ## Install
 
 Build/rebuild and flash **CSI Receiver** on each receiver from Hardware Setup,
