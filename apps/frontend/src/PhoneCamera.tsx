@@ -1,4 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
+import {
+  PhoneBuffer,
+  pendingPhoneStreams,
+  type PhoneBufferMeta,
+} from "./phoneBuffer";
 import { QRCodeSVG } from "qrcode.react";
 import { startPhoneUpload, type UploadStats } from "./phoneUpload";
 
@@ -14,6 +19,8 @@ export function PhoneCamera() {
   const [error, setError] = useState("");
   const [active, setActive] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState<PhoneBufferMeta[]>([]);
+  const [finishing, setFinishing] = useState(false);
   const [frames, setFrames] = useState(0);
   const [skipped, setSkipped] = useState(0);
   const [uploadStats, setUploadStats] = useState<UploadStats | null>(null);
@@ -27,16 +34,55 @@ export function PhoneCamera() {
   const upload = useRef<ReturnType<typeof startPhoneUpload> | null>(null);
   const wakeLock = useRef<any>(null);
   const generation = useRef(0);
+  const buffer = useRef<PhoneBuffer | null>(null);
+  const retry = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const heartbeat = useRef<ReturnType<typeof setInterval> | undefined>(
+    undefined,
+  );
+  const finishRequested = useRef(false);
+  const reconnect = useRef<(() => void) | null>(null);
+  const releaseLock = useRef<(() => void) | null>(null);
+  const refreshSaved = () =>
+    pendingPhoneStreams()
+      .then(setSaved)
+      .catch((e) => setError(`Phone storage unavailable: ${e.message}`));
+  const keepAwake = () => {
+    const current = generation.current;
+    (navigator as any).wakeLock
+      ?.request("screen")
+      .then((lock: any) => {
+        if (current !== generation.current) {
+          void lock.release();
+          return;
+        }
+        wakeLock.current?.release().catch(() => {});
+        wakeLock.current = lock;
+      })
+      .catch(() => {});
+  };
   const credentials = useRef(new URLSearchParams(location.hash.slice(1)));
   const secure =
     window.isSecureContext && !!navigator.mediaDevices?.getUserMedia;
 
   function stop(
-    message = "Camera stopped. Create a new pairing link to reconnect.",
+    message = "Camera stopped. Saved frames remain available below.",
   ) {
     generation.current++;
+    clearTimeout(retry.current);
+    clearInterval(heartbeat.current);
+    reconnect.current = null;
+    finishRequested.current = false;
+    setFinishing(false);
     upload.current?.stop();
     upload.current = null;
+    const oldBuffer = buffer.current;
+    buffer.current = null;
+    const unlock = releaseLock.current;
+    releaseLock.current = null;
+    void (oldBuffer?.close() || Promise.resolve()).finally(() => {
+      unlock?.();
+      void refreshSaved();
+    });
     socket.current?.close();
     socket.current = null;
     media.current?.getTracks().forEach((track) => track.stop());
@@ -51,18 +97,31 @@ export function PhoneCamera() {
     setStatus(message);
   }
   useEffect(() => {
-    const hidden = () => {
-      if (document.hidden)
-        stop(
-          "Camera paused because this page was hidden. Pair again to resume.",
-        );
+    void refreshSaved();
+    const visible = () => {
+      if (!document.hidden && upload.current) keepAwake();
     };
-    document.addEventListener("visibilitychange", hidden);
+    document.addEventListener("visibilitychange", visible);
     return () => {
-      document.removeEventListener("visibilitychange", hidden);
+      document.removeEventListener("visibilitychange", visible);
       stop();
     };
   }, []);
+
+  async function finish() {
+    if (!upload.current) {
+      stop("Camera preview stopped.");
+      return;
+    }
+    finishRequested.current = true;
+    setFinishing(true);
+    setStatus(
+      "Finishing capture and uploading saved frames… Keep this page open.",
+    );
+    await upload.current.pauseCapture();
+    media.current?.getTracks().forEach((track) => track.stop());
+    media.current = null;
+  }
 
   async function openCamera(
     choice: string,
@@ -131,8 +190,12 @@ export function PhoneCamera() {
     }
     const track = stream.getVideoTracks()[0];
     track.onended = () => {
-      if (current === generation.current)
-        stop("Phone camera access ended. Pair again to reconnect.");
+      if (current === generation.current) {
+        void upload.current?.pauseCapture();
+        setError(
+          "Camera access ended. Saved frames will continue uploading. Uncaptured video cannot be recovered.",
+        );
+      }
     };
     video.current!.srcObject = stream;
     await video.current!.play();
@@ -163,19 +226,15 @@ export function PhoneCamera() {
     }
   }
 
-  function start() {
+  async function start(resumeId?: string) {
     if (!secure) {
-      setError(
-        "Phone camera access needs trusted HTTPS. Open the secure phone link after installing the lab certificate.",
-      );
+      setError("Phone camera access needs trusted HTTPS.");
       return;
     }
-    const id = credentials.current.get("id");
+    const id = resumeId || credentials.current.get("id");
     const token = credentials.current.get("token");
-    if (!id || !token) {
-      setError(
-        "Open a fresh pairing link from Hardware Setup on the computer.",
-      );
+    if (!id) {
+      setError("Open a pairing link or resume a saved camera below.");
       return;
     }
     setError("");
@@ -184,91 +243,223 @@ export function PhoneCamera() {
     setFrames(0);
     setSkipped(0);
     setUploadStats(null);
+    finishRequested.current = false;
+    setFinishing(false);
     const current = ++generation.current;
-    const ws = new WebSocket(
-      `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/phone/stream`,
-    );
-    socket.current = ws;
-    let settings: any;
-    ws.onopen = () => ws.send(JSON.stringify({ id, token }));
-    ws.onerror = () => {
-      if (current === generation.current) {
-        stop();
-        setError(
-          "Could not connect. Check the phone address, trusted HTTPS certificate, and Wi-Fi.",
-        );
+    const valid = () => current === generation.current;
+    try {
+      // One tab owns a buffer. Holding a Web Lock also protects sequence numbers
+      // across a reload/recovery tab without a stale timeout-based lease.
+      if (navigator.locks) {
+        await new Promise<void>((resolve, reject) => {
+          void navigator.locks
+            .request(`csi-phone:${id}`, { ifAvailable: true }, async (lock) => {
+              if (!lock) {
+                reject(
+                  new Error("This camera is already open in another tab."),
+                );
+                return;
+              }
+              await new Promise<void>((release) => {
+                releaseLock.current = release;
+                resolve();
+              });
+            })
+            .catch(reject);
+        });
       }
-    };
-    ws.onclose = () => {
-      if (current === generation.current)
-        stop("Disconnected. Create a new phone pairing link on the computer.");
-    };
-    ws.onmessage = async (event) => {
-      if (current !== generation.current) return;
-      const data = JSON.parse(event.data);
-      try {
-        if (data.type === "error") {
-          stop();
-          setError(data.message);
-          return;
-        }
-        if (data.type === "settings") {
-          settings = data;
-          setStatus("Allow camera access on this phone…");
-          if (!(await openCamera(cameraChoice, current, data))) return;
-          ws.send(
-            JSON.stringify({
-              type: "ready",
-              native_resolution: [
-                video.current!.videoWidth,
-                video.current!.videoHeight,
-              ],
-            }),
+      const previous = (await pendingPhoneStreams()).find(
+        (item) => item.id === id,
+      );
+      if (!valid()) {
+        releaseLock.current?.();
+        return;
+      }
+      if (previous) buffer.current = await PhoneBuffer.open(id);
+      if (!previous && !token)
+        throw new Error("Open a fresh pairing link from the computer.");
+      void navigator.storage?.persist?.().catch(() => {});
+      let attempts = 0;
+      function connect() {
+        if (!valid()) return;
+        const ws = new WebSocket(
+          `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/phone/stream`,
+        );
+        socket.current = ws;
+        let ready = false,
+          lastReceived = performance.now(),
+          lastSequence = -1;
+        let samples: { probe: string; mid: number; rtt: number }[] = [];
+        let messages = Promise.resolve();
+        const send = (data: unknown) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+        };
+        const ours = () => valid() && socket.current === ws;
+        ws.onopen = () =>
+          send({
+            id,
+            protocol: 2,
+            ...(buffer.current?.meta.resumeToken
+              ? { resume_token: buffer.current.meta.resumeToken }
+              : { token }),
+          });
+        const retryConnection = () => {
+          if (!ours()) return;
+          clearInterval(heartbeat.current);
+          socket.current = null;
+          ws.close();
+          upload.current?.detach();
+          setStatus(
+            finishRequested.current
+              ? "Disconnected. Saved frames will upload when the collector reconnects…"
+              : "Disconnected. Saving frames on this phone and reconnecting…",
           );
-        }
-        if (data.type === "ready") {
+          retry.current = setTimeout(
+            connect,
+            Math.min(5000, 500 * 2 ** Math.min(attempts++, 4)),
+          );
+        };
+        reconnect.current = retryConnection;
+        ws.onerror = retryConnection;
+        ws.onclose = retryConnection;
+        const activate = async () => {
+          if (!ours()) return;
+          const store = buffer.current!;
+          if (!upload.current) {
+            upload.current = startPhoneUpload(
+              video.current!,
+              store,
+              store.meta.settings,
+              (stats) => {
+                if (!valid()) return;
+                setFrames(stats.frames);
+                setSkipped(stats.skipped);
+                setUploadStats(stats);
+              },
+              (e) => {
+                if (valid())
+                  setError(
+                    `Capture paused: ${e.message} Saved frames will continue uploading.`,
+                  );
+              },
+              () => reconnect.current?.(),
+            );
+          }
+          await upload.current.attach(ws, lastSequence);
+          if (!ours()) {
+            upload.current?.detach();
+            return;
+          }
+          ready = true;
+          attempts = 0;
           setBusy(false);
           setActive(true);
+          finishRequested.current ||= store.meta.paused;
+          setFinishing(finishRequested.current);
+          const settings = store.meta.settings;
           setStatus(
-            `Streaming ${settings.width} × ${settings.height} at up to ${settings.fps} FPS`,
+            finishRequested.current
+              ? "Uploading saved frames… Keep this page open."
+              : `Streaming ${settings.width} × ${settings.height} at up to ${settings.fps} FPS`,
           );
-          // The fragment is never sent in HTTP requests or server access logs.
           history.replaceState(null, "", location.pathname);
-          (navigator as any).wakeLock
-            ?.request("screen")
-            .then((lock: any) => {
-              if (current === generation.current) wakeLock.current = lock;
-              else lock.release();
+          keepAwake();
+        };
+        // Heartbeats detect dead sockets even while no frames can get through.
+        heartbeat.current = setInterval(() => {
+          if (!ours()) return;
+          if (performance.now() - lastReceived > (ready ? 10000 : 120000)) {
+            retryConnection();
+            return;
+          }
+          if (ready && upload.current) {
+            const progress = upload.current.progress();
+            send({
+              type:
+                finishRequested.current &&
+                buffer.current!.meta.paused &&
+                !progress.buffered_frames
+                  ? "finish"
+                  : "heartbeat",
+              ...progress,
+            });
+          }
+        }, 2000);
+        ws.onmessage = (event) => {
+          lastReceived = performance.now();
+          messages = messages
+            .then(async () => {
+              if (!ours()) return;
+              const data = JSON.parse(event.data);
+              if (data.type === "error") throw new Error(data.message);
+              if (data.type === "settings") {
+                if (!buffer.current)
+                  buffer.current = await PhoneBuffer.open(id!, data);
+                await buffer.current.update({ resumeToken: data.resume_token });
+                if (!ours()) return;
+                if (!media.current && !buffer.current.meta.paused) {
+                  setStatus("Allow camera access on this phone…");
+                  if (!(await openCamera(cameraChoice, current, data))) return;
+                }
+                send({
+                  type: "ready",
+                  native_resolution: media.current
+                    ? [video.current!.videoWidth, video.current!.videoHeight]
+                    : [data.width, data.height],
+                });
+              } else if (data.type === "ready") {
+                await buffer.current!.update({
+                  resumeToken: data.resume_token,
+                });
+                lastSequence = data.last_sequence;
+                if (data.ended) {
+                  await buffer.current!.acknowledge(lastSequence);
+                  await buffer.current!.complete();
+                  stop("Camera stopped. All frames uploaded.");
+                } else if (data.clock_ready) await activate();
+                else send({ type: "clock", client_ms: buffer.current!.now() });
+              } else if (data.type === "clock") {
+                const received = buffer.current!.now();
+                samples.push({
+                  probe: data.probe,
+                  mid: (data.client_ms + received) / 2,
+                  rtt: received - data.client_ms,
+                });
+                if (samples.length < 3)
+                  send({ type: "clock", client_ms: buffer.current!.now() });
+                else {
+                  const best = samples.sort((a, b) => a.rtt - b.rtt)[0];
+                  send({
+                    type: "clock_commit",
+                    probe: best.probe,
+                    client_mid_ms: best.mid,
+                  });
+                }
+              } else if (data.type === "synced") await activate();
+              else if (data.type === "ack")
+                await upload.current?.ack(data.frame_idx);
+              else if (data.type === "finished") {
+                await buffer.current!.complete();
+                stop("Camera stopped. All frames uploaded.");
+              }
             })
-            .catch(() => {});
-          upload.current = startPhoneUpload(
-            video.current!,
-            ws,
-            settings,
-            (stats) => {
-              if (current !== generation.current) return;
-              setFrames(stats.frames);
-              setSkipped(stats.skipped);
-              setUploadStats(stats);
-            },
-            (error) => {
-              if (current !== generation.current) return;
-              stop();
-              setError(error.message);
-            },
-          );
-        }
-        if (data.type === "ack") {
-          upload.current?.ack(data.frame_idx);
-        }
-      } catch (e) {
-        if (current === generation.current) {
-          stop();
-          setError((e as Error).message);
-        }
+            .catch((e) => {
+              if (ours()) {
+                stop();
+                setError(e.message);
+              }
+            });
+        };
       }
-    };
+      connect();
+    } catch (e) {
+      if (valid()) {
+        stop();
+        setError((e as Error).message);
+      }
+    }
   }
+
   return (
     <main className="phone-page">
       <section className="panel">
@@ -337,26 +528,25 @@ export function PhoneCamera() {
           <button
             className="primary"
             disabled={active || busy || !secure}
-            onClick={start}
+            onClick={() => void start()}
           >
             Start phone camera
           </button>
           <button
-            disabled={!active && !busy && !previewReady}
+            disabled={finishing || (!active && !busy && !previewReady)}
             className="danger"
-            onClick={() =>
-              stop(
-                active || socket.current
-                  ? undefined
-                  : "Camera preview stopped.",
-              )
-            }
+            onClick={() => void finish().catch((e) => setError(e.message))}
           >
             Stop phone camera
           </button>
         </div>
         <div className="phone-counters">
           <span>{frames} frames delivered</span>
+          <span aria-label="Buffered phone frames">
+            {uploadStats?.bufferedFrames || 0} frames saved locally ·{" "}
+            {((uploadStats?.bufferedBytes || 0) / 1048576).toFixed(1)} MiB
+            awaiting upload
+          </span>
           <span>{skipped} frames skipped before upload</span>
         </div>
         {uploadStats && (
@@ -375,9 +565,23 @@ export function PhoneCamera() {
         )}
         <p className="hint">
           Keep this page visible and the phone awake. Return to the computer to
-          select this camera, run preflight, and start recording. Host
-          timestamps measure frame arrival; Wi-Fi and JPEG encoding add delay.
+          select this camera, run preflight, and start recording. Connection
+          losses are retried automatically; up to 512 MiB of unacknowledged
+          frames are saved on this phone (subject to available browser storage).
+          Keep this page open until uploads finish. Closing or locking the
+          browser can stop capture. Capture timestamps use an estimated
+          phone-to-collector clock offset; original capture and arrival times
+          are also retained.
         </p>
+        {!active && !busy && saved.length > 0 && (
+          <div className="actions">
+            {saved.map((item) => (
+              <button key={item.id} onClick={() => void start(item.id)}>
+                Resume {item.settings.name} · {item.count} saved frames
+              </button>
+            ))}
+          </div>
+        )}
         <a href="/phone-ca.crt">Download lab CA certificate</a>
       </section>
     </main>

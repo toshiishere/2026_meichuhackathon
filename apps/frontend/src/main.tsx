@@ -22,6 +22,14 @@ type Camera = {
   fixed_frame_rate: boolean;
   geometry: string;
 };
+function pairedCameraSettings(camera: Camera, devices: Json[]): Camera {
+  const phone = camera.device.startsWith("phone://")
+    ? devices.find((device) => device.device === camera.device)
+    : undefined;
+  return phone
+    ? { ...camera, width: phone.width, height: phone.height, fps: phone.fps }
+    : camera;
+}
 const api = async (path: string, body?: unknown) => {
   const response = await fetch(
     "/api" + path,
@@ -135,7 +143,7 @@ function App() {
   const [ledType, setLedType] = useState("gpio");
   const [csiTransport, setCsiTransport] = useState("auto");
   const [activeLow, setActiveLow] = useState(false);
-  const [camera, setCamera] = useState<Camera>({
+  const [cameraSettings, setCamera] = useState<Camera>({
     device: "",
     width: 1280,
     height: 720,
@@ -143,6 +151,9 @@ function App() {
     geometry: "",
     fixed_frame_rate: true,
   });
+  // The connected phone's pairing settings are authoritative for both the
+  // displayed fields and all preview/test/recording requests.
+  const camera = pairedCameraSettings(cameraSettings, cameras);
   const [preview, setPreview] = useState("");
   function generateUUID() {
     if (typeof crypto.randomUUID === "function") {
@@ -251,7 +262,13 @@ function App() {
       }));
     }
     setSelectedPort((old) => old || p[0]?.port || "");
-    setCamera((old) => ({ ...old, device: old.device || c[0]?.device || "" }));
+    setCamera((old) =>
+      pairedCameraSettings(
+        { ...old, device: old.device || c[0]?.device || "" },
+        c,
+      ),
+    );
+    setPreflight(null);
     setSender((old) => (b.some((x: Board) => x.identity === old) ? old : ""));
     setReceivers((old) =>
       old.length
@@ -370,15 +387,8 @@ function App() {
     await refresh();
   };
   const selectCamera = (device: string) => {
-    const selected = cameras.find((c) => c.device === device);
     closePreview();
-    setCamera((old) => ({
-      ...old,
-      device,
-      ...(device.startsWith("phone://") && selected
-        ? { width: selected.width, height: selected.height, fps: selected.fps }
-        : {}),
-    }));
+    setCamera((old) => pairedCameraSettings({ ...old, device }, cameras));
     setPreflight(null);
   };
   useEffect(() => {
@@ -991,7 +1001,13 @@ function App() {
                           selectCamera(e.target.value);
                         }}
                       >
-                        {!cameras.length && (
+                        {camera.device &&
+                          !cameras.some((c) => c.device === camera.device) && (
+                            <option value={camera.device}>
+                              Disconnected · {camera.device}
+                            </option>
+                          )}
+                        {!cameras.length && !camera.device && (
                           <option value="">No cameras</option>
                         )}
                         {cameras.map((c) => (
@@ -1023,6 +1039,15 @@ function App() {
                         </Field>
                       ))}
                     </div>
+                    {camera.device.startsWith("phone://") && (
+                      <p className="hint">
+                        Resolution and FPS come from this phone's pairing link:{" "}
+                        {camera.width} × {camera.height} at {camera.fps} FPS.
+                        Create a new pairing link to change them, connect the
+                        phone, then select it here. Changing the link preset
+                        alone does not change an already connected phone.
+                      </p>
+                    )}
                     <Field label="Camera position / orientation">
                       <input
                         value={camera.geometry}
@@ -1293,7 +1318,10 @@ function App() {
                     </div>
                     <p className="hint">
                       Camera: {camera.width} × {camera.height} at {camera.fps}{" "}
-                      FPS. Change resolution in Hardware Setup.
+                      FPS.{" "}
+                      {camera.device.startsWith("phone://")
+                        ? "Settings follow the selected phone's pairing link."
+                        : "Change resolution in Hardware Setup."}
                     </p>
                     {mode === "synthetic" && (
                       <div className="form-grid">
@@ -1790,7 +1818,28 @@ function LiveStatus({ status }: { status: Json }) {
               </tbody>
             </table>
           </div>
+          {status.camera?.phone_sync_wait_seconds !== undefined && (
+            <p role="status" className="notice">
+              Waiting for saved phone frames · up to{" "}
+              {status.camera.phone_sync_wait_seconds}s remaining. Keep the phone
+              page open and reconnect its network.
+            </p>
+          )}
+          {status.camera?.phone_connected === false && (
+            <p className="notice">
+              Phone disconnected. CSI collection continues; the phone will
+              upload saved frames when it reconnects.
+            </p>
+          )}
           <div className="metrics camera-metrics">
+            {status.camera?.phone_buffered_frames !== undefined && (
+              <Metric
+                label="Last reported phone buffer"
+                value={status.camera.phone_buffered_frames}
+                sub={`${status.camera.phone_reconnects || 0} reconnections`}
+              />
+            )}
+
             <Metric
               label="Frames recorded"
               value={status.camera?.frames_recorded || 0}

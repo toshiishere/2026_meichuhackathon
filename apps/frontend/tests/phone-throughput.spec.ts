@@ -34,13 +34,15 @@ for (const [width, height, fps, fallback] of [
     const timers = new Set<ReturnType<typeof setTimeout>>();
     let dropAcks = false,
       outstanding = 0,
-      peak = 0;
+      peak = 0,
+      connections = 0;
     page.on("pageerror", (error) => errors.push(error.message));
     if (fallback)
       await page.addInitScript(() => {
         Object.defineProperty(window, "OffscreenCanvas", { value: undefined });
       });
     await page.routeWebSocket("**/api/phone/stream", (ws) => {
+      connections++;
       const server = ws.connectToServer();
       ws.onMessage((message) => {
         if (typeof message !== "string") {
@@ -94,14 +96,23 @@ for (const [width, height, fps, fallback] of [
       expect(result.result.resolution).toEqual([width, height]);
       expect(peak).toBeGreaterThan(1);
       expect(peak).toBeLessThanOrEqual(Math.ceil(fps / 4));
-      // If acknowledgements disappear, the browser must stop at its finite
-      // window and report a stall rather than silently queuing more video.
+      // Lost acknowledgements must leave frames in persistent storage and
+      // reconnect automatically; they must not stop camera capture.
       dropAcks = true;
-      await expect(page.getByRole("alert")).toContainText(
-        "stopped acknowledging",
-        { timeout: 8000 },
+      await expect
+        .poll(() => connections, { timeout: 8000 })
+        .toBeGreaterThan(1);
+      dropAcks = false;
+      await expect(page.getByRole("status")).toContainText("Streaming", {
+        timeout: 10000,
+      });
+      await page
+        .getByRole("button", { name: "Stop phone camera", exact: true })
+        .click();
+      await expect(page.getByRole("status")).toContainText(
+        "All frames uploaded",
+        { timeout: 15000 },
       );
-      expect(peak).toBeLessThanOrEqual(Math.ceil(fps / 4));
       expect(errors).toEqual([]);
     } finally {
       for (const timer of timers) clearTimeout(timer);
