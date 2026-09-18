@@ -66,7 +66,7 @@ See [firmware provenance](firmware/README.md) and
 The working source was found in `/home/toshi/esp-csi` and copied into this repo;
 no host path dependency remains. The original repository and boards were not
 modified. Receiver output: **921600 baud**. Sender: **100 Hz**, **channel 11**,
-**HT40**, source MAC `1a:00:00:00:00:00`. See [firmware/README.md](firmware/README.md)
+**HT20**, source MAC `1a:00:00:00:00:00`. See [firmware/README.md](firmware/README.md)
 for the preserved commit, SDK configs, targets and hashes.
 
 ### Identify and flash boards
