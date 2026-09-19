@@ -50,6 +50,38 @@ export function Deploy({
   const [tick, setTick] = useState(0);
   const [previewReady, setPreviewReady] = useState(false);
   const initialized = useRef(false);
+  const video = useRef<HTMLVideoElement>(null);
+  const [videoError, setVideoError] = useState("");
+  useEffect(() => {
+    const player = video.current;
+    if (!player) return;
+    const sync = () => {
+      const position = state.video_time_s;
+      player.playbackRate = state.options?.replay_speed || 1;
+      const playing =
+        state.status === "running" &&
+        state.video_playing !== false &&
+        !serviceError;
+      if (
+        Number.isFinite(position) &&
+        Math.abs(player.currentTime - position) > (playing ? 0.25 : 0.02)
+      )
+        player.currentTime = position;
+      if (playing) {
+        void player.play().catch((error: DOMException) => {
+          if (error.name !== "AbortError")
+            setVideoError(
+              "Video playback could not start. Check browser autoplay settings.",
+            );
+        });
+      } else {
+        player.pause();
+      }
+    };
+    sync();
+    player.addEventListener("loadedmetadata", sync);
+    return () => player.removeEventListener("loadedmetadata", sync);
+  }, [state, serviceError]);
   const running = active(state.status);
   const receivers = boards.filter(
     (b) =>
@@ -109,7 +141,7 @@ export function Deploy({
       } catch (e) {
         if (alive) setServiceError((e as Error).message);
       } finally {
-        if (alive) timer = setTimeout(poll, 500);
+        if (alive) timer = setTimeout(poll, 200);
       }
     }
     void poll();
@@ -122,21 +154,23 @@ export function Deploy({
     setBusy(true);
     setError("");
     setPreviewReady(false);
+    setVideoError("");
     try {
       const b = receivers.find((x) => x.identity === receiver);
       const p = ports.find((x) => x.identity === receiver);
       if (source === "live" && (!b || !p))
         throw new Error("Receiver disconnected; refresh hardware.");
       const selectedCamera = cameras.find((c) => c.device === cameraDevice);
-      const cameraConfig = cameraDevice
-        ? {
-            device: cameraDevice,
-            width: selectedCamera?.width || camera.width,
-            height: selectedCamera?.height || camera.height,
-            fps: selectedCamera?.fps || camera.fps,
-            fixed_frame_rate: camera.fixed_frame_rate,
-          }
-        : null;
+      const cameraConfig =
+        source === "live" && cameraDevice
+          ? {
+              device: cameraDevice,
+              width: selectedCamera?.width || camera.width,
+              height: selectedCamera?.height || camera.height,
+              fps: selectedCamera?.fps || camera.fps,
+              fixed_frame_rate: camera.fixed_frame_rate,
+            }
+          : null;
       const result = await api("/start", {
         model_session_id: model,
         source,
@@ -321,22 +355,24 @@ export function Deploy({
               </label>
             </>
           )}
-          <label className="field">
-            <span>Live camera (optional)</span>
-            <select
-              aria-label="Live camera (optional)"
-              value={cameraDevice}
-              disabled={running || busy}
-              onChange={(e) => setCameraDevice(e.target.value)}
-            >
-              <option value="">No camera</option>
-              {cameras.map((c) => (
-                <option key={c.device} value={c.device}>
-                  {c.name || c.device}
-                </option>
-              ))}
-            </select>
-          </label>
+          {source === "live" && (
+            <label className="field">
+              <span>Live camera (optional)</span>
+              <select
+                aria-label="Live camera (optional)"
+                value={cameraDevice}
+                disabled={running || busy}
+                onChange={(e) => setCameraDevice(e.target.value)}
+              >
+                <option value="">No camera</option>
+                {cameras.map((c) => (
+                  <option key={c.device} value={c.device}>
+                    {c.name || c.device}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
         </div>
         {selectedModel && (
           <p className="subtle">
@@ -349,8 +385,8 @@ export function Deploy({
           <p className="subtle">
             Replay preserves recorded CSI timing. Using the model’s own training
             session is a demonstration, not a measure of accuracy on new
-            recordings. An optional live camera shows the present scene, not the
-            replayed session.
+            recordings. Recorded video follows the same capture timestamps and
+            replay speed as CSI.
           </p>
         )}
         {cameraDevice && (
@@ -450,28 +486,58 @@ export function Deploy({
               .join(" · ")}
           </p>
         )}
-        {state.options?.camera && state.capture_id && (
+        {state.options?.source === "replay" && (
           <>
-            <h3>Live camera · visualization only</h3>
-            {state.camera_error && (
+            <h3>Recorded video · synchronized with CSI replay</h3>
+            {(state.video_error || videoError) && (
               <p className="notice warning">
-                Camera: {state.camera_error}. CSI inference continues.
+                Video: {state.video_error || videoError}. CSI inference
+                continues.
               </p>
             )}
-            {!previewReady && (
-              <p className="subtle">Waiting for a fresh camera frame…</p>
-            )}
-            <div className="preview">
-              <img
-                src={`/api/deploy/camera/${state.capture_id}?frame=${tick}`}
-                alt="Deployment live camera"
-                onLoad={() => setPreviewReady(true)}
-                onError={() => setPreviewReady(false)}
-                style={{ visibility: previewReady ? "visible" : "hidden" }}
+            {state.video_available && (
+              <video
+                key={state.id || state.options.replay_session_id}
+                ref={video}
+                aria-label="Synchronized replay video"
+                muted
+                playsInline
+                preload="auto"
+                src={`/api/sessions/${encodeURIComponent(state.options.replay_session_id)}/files/raw/video.mp4`}
+                onPlaying={() => setVideoError("")}
+                onError={() =>
+                  setVideoError(
+                    "Recorded video is unavailable or cannot be decoded",
+                  )
+                }
               />
-            </div>
+            )}
           </>
         )}
+        {state.options?.source === "live" &&
+          state.options?.camera &&
+          state.capture_id && (
+            <>
+              <h3>Live camera · aligned with CSI capture time</h3>
+              {state.camera_error && (
+                <p className="notice warning">
+                  Camera: {state.camera_error}. CSI inference continues.
+                </p>
+              )}
+              {!previewReady && (
+                <p className="subtle">Waiting for a fresh camera frame…</p>
+              )}
+              <div className="preview">
+                <img
+                  src={`/api/deploy/camera/${state.capture_id}?frame=${tick}${state.source_timestamp_ns ? `&timestamp_ns=${state.source_timestamp_ns}` : ""}`}
+                  alt="Deployment live camera"
+                  onLoad={() => setPreviewReady(true)}
+                  onError={() => setPreviewReady(false)}
+                  style={{ visibility: previewReady ? "visible" : "hidden" }}
+                />
+              </div>
+            </>
+          )}
         {!!state.history?.length && (
           <details>
             <summary>Recent predictions</summary>

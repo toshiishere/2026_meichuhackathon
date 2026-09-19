@@ -1,0 +1,71 @@
+Device: cuda
+Ignoring movements not in --classes: ['Sitting', 'Standing']
+Training classes: ['Static', 'Walking', 'Falling']
+Intervals: 74 total -> 59 train, 15 val
+Windows: 1746 train, 840 val
+  train class counts: {'Static': 1116, 'Walking': 561, 'Falling': 69}
+  val class counts: {'Static': 723, 'Walking': 105, 'Falling': 12}
+Class weights: {'Static': 0.15654991567134857, 'Walking': 0.31142547726631165, 'Falling': 2.532024621963501}
+
+=== Phase 1: frozen backbone, training new head only ===
+Trainable params: 1539
+[frozen] epoch 1/10: train_acc=0.752 train_loss=0.9240  val_acc=0.886 val_f1=0.519 val_loss=0.5206
+[frozen] epoch 2/10: train_acc=0.771 train_loss=0.9012  val_acc=0.712 val_f1=0.350 val_loss=0.7858
+[frozen] epoch 3/10: train_acc=0.772 train_loss=0.8660  val_acc=0.838 val_f1=0.482 val_loss=0.5919
+[frozen] epoch 4/10: train_acc=0.764 train_loss=0.8847  val_acc=0.836 val_f1=0.478 val_loss=0.5610
+[frozen] epoch 5/10: train_acc=0.767 train_loss=0.8664  val_acc=0.806 val_f1=0.461 val_loss=0.6288
+[frozen] epoch 6/10: train_acc=0.774 train_loss=0.8883  val_acc=0.764 val_f1=0.445 val_loss=0.7839
+[frozen] epoch 7/10: train_acc=0.786 train_loss=0.8820  val_acc=0.825 val_f1=0.496 val_loss=0.6714
+[frozen] epoch 8/10: train_acc=0.774 train_loss=0.8448  val_acc=0.890 val_f1=0.531 val_loss=0.5752
+[frozen] epoch 9/10: train_acc=0.773 train_loss=0.9140  val_acc=0.705 val_f1=0.412 val_loss=0.8414
+[frozen] epoch 10/10: train_acc=0.784 train_loss=0.8529  val_acc=0.892 val_f1=0.529 val_loss=0.5126
+
+=== Phase 2: unfrozen, fine-tuning whole model ===
+Trainable params: 11169219
+[finetune] epoch 1/30: train_acc=0.751 train_loss=0.8996  val_acc=0.868 val_f1=0.519 val_loss=0.4478
+[finetune] epoch 2/30: train_acc=0.837 train_loss=0.6826  val_acc=0.933 val_f1=0.572 val_loss=0.2688
+[finetune] epoch 3/30: train_acc=0.865 train_loss=0.6009  val_acc=0.908 val_f1=0.585 val_loss=0.2946
+[finetune] epoch 4/30: train_acc=0.892 train_loss=0.5071  val_acc=0.931 val_f1=0.641 val_loss=0.2441
+[finetune] epoch 5/30: train_acc=0.902 train_loss=0.4057  val_acc=0.964 val_f1=0.621 val_loss=0.1644
+[finetune] epoch 6/30: train_acc=0.923 train_loss=0.3348  val_acc=0.951 val_f1=0.682 val_loss=0.1519
+[finetune] epoch 7/30: train_acc=0.932 train_loss=0.2954  val_acc=0.957 val_f1=0.644 val_loss=0.1365
+[finetune] epoch 8/30: train_acc=0.949 train_loss=0.2183  val_acc=0.949 val_f1=0.683 val_loss=0.1646
+[finetune] epoch 9/30: train_acc=0.954 train_loss=0.1766  val_acc=0.911 val_f1=0.620 val_loss=0.2530
+[finetune] epoch 10/30: train_acc=0.960 train_loss=0.1622  val_acc=0.925 val_f1=0.640 val_loss=0.2184
+[finetune] epoch 11/30: train_acc=0.970 train_loss=0.1182  val_acc=0.949 val_f1=0.696 val_loss=0.2010
+[finetune] epoch 12/30: train_acc=0.981 train_loss=0.0877  val_acc=0.958 val_f1=0.650 val_loss=0.1849
+[finetune] epoch 13/30: train_acc=0.968 train_loss=0.1221  val_acc=0.942 val_f1=0.642 val_loss=0.1879
+[finetune] epoch 14/30: train_acc=0.966 train_loss=0.1433  val_acc=0.949 val_f1=0.655 val_loss=0.1691
+[finetune] epoch 15/30: train_acc=0.981 train_loss=0.0611  val_acc=0.957 val_f1=0.678 val_loss=0.1679
+[finetune] epoch 16/30: train_acc=0.982 train_loss=0.0590  val_acc=0.949 val_f1=0.631 val_loss=0.1926
+[finetune] epoch 17/30: train_acc=0.985 train_loss=0.0485  val_acc=0.951 val_f1=0.665 val_loss=0.1984
+[finetune] epoch 18/30: train_acc=0.994 train_loss=0.0309  val_acc=0.950 val_f1=0.655 val_loss=0.2025
+[finetune] epoch 19/30: train_acc=0.990 train_loss=0.0303  val_acc=0.949 val_f1=0.660 val_loss=0.2066
+[finetune] epoch 20/30: train_acc=0.995 train_loss=0.0228  val_acc=0.936 val_f1=0.623 val_loss=0.2863
+[finetune] epoch 21/30: train_acc=0.987 train_loss=0.0358  val_acc=0.926 val_f1=0.582 val_loss=0.2553
+[finetune] epoch 22/30: train_acc=0.989 train_loss=0.0413  val_acc=0.937 val_f1=0.629 val_loss=0.1984
+[finetune] epoch 23/30: train_acc=0.994 train_loss=0.0195  val_acc=0.939 val_f1=0.649 val_loss=0.2408
+[finetune] epoch 24/30: train_acc=0.982 train_loss=0.0461  val_acc=0.912 val_f1=0.625 val_loss=0.2944
+[finetune] epoch 25/30: train_acc=0.974 train_loss=0.0997  val_acc=0.857 val_f1=0.557 val_loss=0.4381
+[finetune] epoch 26/30: train_acc=0.993 train_loss=0.0318  val_acc=0.943 val_f1=0.686 val_loss=0.2131
+[finetune] epoch 27/30: train_acc=0.995 train_loss=0.0261  val_acc=0.945 val_f1=0.671 val_loss=0.2106
+[finetune] epoch 28/30: train_acc=0.998 train_loss=0.0162  val_acc=0.940 val_f1=0.683 val_loss=0.2270
+[finetune] epoch 29/30: train_acc=0.998 train_loss=0.0085  val_acc=0.942 val_f1=0.670 val_loss=0.2445
+[finetune] epoch 30/30: train_acc=0.997 train_loss=0.0122  val_acc=0.939 val_f1=0.653 val_loss=0.2354
+
+Best val macro-F1: 0.696
+
+Final validation report (best checkpoint):
+              precision    recall  f1-score   support
+
+      Static      0.991     0.967     0.979       723
+     Walking      0.754     0.905     0.823       105
+     Falling      0.333     0.250     0.286        12
+
+    accuracy                          0.949       840
+   macro avg      0.693     0.707     0.696       840
+weighted avg      0.952     0.949     0.950       840
+
+
+Saved checkpoint: ./finetuned/finetuned_resnet18.pth
+Saved class mapping: ./finetuned/classes.json

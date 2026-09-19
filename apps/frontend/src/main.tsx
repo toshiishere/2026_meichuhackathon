@@ -398,13 +398,20 @@ function App() {
   };
   useEffect(() => {
     if (
-      currentJob?.kind === "session-remove" &&
-      currentJob.status === "completed"
+      ["session-remove", "session-recover"].includes(currentJob?.kind) &&
+      currentJob?.status === "completed"
     ) {
-      setDetail((old) =>
-        old?.session_id === currentJob.result.session_id ? null : old,
-      );
-      run(refresh);
+      if (currentJob.kind === "session-recover") {
+        run(async () => {
+          await refresh();
+          await inspectSession(currentJob.result.session_id);
+        });
+      } else {
+        setDetail((old) =>
+          old?.session_id === currentJob.result.session_id ? null : old,
+        );
+        run(refresh);
+      }
     }
   }, [currentJob?.id, currentJob?.status]);
   const cameraQuery = `token=${previewToken.current}&device=${encodeURIComponent(camera.device)}&width=${camera.width}&height=${camera.height}&fps=${camera.fps}&fixed_frame_rate=${camera.fixed_frame_rate}`;
@@ -1438,7 +1445,14 @@ function App() {
           )}
 
           {page === "Train" && <Train sessions={sessions} />}
-          {page === "Deploy" && <Deploy boards={boards} ports={ports} cameras={cameras} camera={camera} />}
+          {page === "Deploy" && (
+            <Deploy
+              boards={boards}
+              ports={ports}
+              cameras={cameras}
+              camera={camera}
+            />
+          )}
           {page === "Sessions" && (
             <>
               <section className="panel">
@@ -1453,6 +1467,15 @@ function App() {
                 <SessionTable
                   sessions={sessions}
                   inspect={(sid) => run(() => inspectSession(sid))}
+                  recover={(id) => {
+                    if (
+                      window.confirm(
+                        `Recover ${id}? Valid temporary recordings will be renamed and marked recovered. Original recording errors will be retained.`,
+                      )
+                    )
+                      run(() => submitJob(`/sessions/${id}/recover`, {}));
+                  }}
+                  recoveryBusy={busy || hardwareBusy || recording}
                   remove={(id) => {
                     setError("");
                     setRemoveSessionId(id);
@@ -1466,8 +1489,17 @@ function App() {
                       <span className="eyebrow">SESSION DETAIL</span>
                       <h2>{detail.session_id}</h2>
                     </div>
-                    <Badge value={detail.status} />
+                    <Badge
+                      value={detail.recovered ? "recovered" : detail.status}
+                    />
                   </div>
+                  {detail.recovered && (
+                    <p className="notice warning">
+                      Recovered from temporary files. Original recording errors
+                      are retained in the metadata; review data quality before
+                      training.
+                    </p>
+                  )}
                   {detail.status === "incomplete" && (
                     <div className="notice warning">
                       This recording did not finalize successfully. Original and
@@ -1708,10 +1740,14 @@ function SessionTable({
   sessions,
   inspect,
   remove,
+  recover,
+  recoveryBusy,
 }: {
   sessions: Json[];
   inspect: (sid: string) => void;
   remove?: (sid: string) => void;
+  recover?: (sid: string) => void;
+  recoveryBusy?: boolean;
 }) {
   return !sessions.length ? (
     <Empty>
@@ -1755,10 +1791,19 @@ function SessionTable({
                 <Badge value={s.quality || "unknown"} />
               </td>
               <td>
-                <Badge value={s.status} />
+                <Badge value={s.recovered ? "recovered" : s.status} />
               </td>
               {remove && (
                 <td>
+                  {recover && s.status === "incomplete" && (
+                    <button
+                      disabled={recoveryBusy}
+                      onClick={() => recover(s.session_id)}
+                      aria-label={`Recover session ${s.session_id}`}
+                    >
+                      Recover
+                    </button>
+                  )}
                   <button
                     className="danger"
                     disabled={["starting", "recording", "stopping"].includes(

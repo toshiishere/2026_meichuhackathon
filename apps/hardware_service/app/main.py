@@ -8,7 +8,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 import cv2
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, Response
 from apps.common.session_lock import session_lock
 from apps.common.config import DATA, MODE, DEFAULTS
@@ -93,8 +93,8 @@ def deploy_stop(token: str):
 
 
 @app.get("/deploy/capture/{token}/camera")
-def deploy_camera(token: str):
-    jpeg, stamp = deploy_capture.frame(token)
+def deploy_camera(token: str, timestamp_ns: int | None = Query(default=None, ge=0)):
+    jpeg, stamp = deploy_capture.frame(token, timestamp_ns)
     return Response(
         jpeg,
         media_type="image/jpeg",
@@ -282,7 +282,12 @@ def start(body: CollectionConfig):
         )
 
     def work(log, stop):
-        global recorder, collection_stop, collection_pending, collection_error, preflight_status
+        global \
+            recorder, \
+            collection_stop, \
+            collection_pending, \
+            collection_error, \
+            preflight_status
         collection_stop = stop
         collection_pending = True
         collection_error = None
@@ -479,6 +484,38 @@ async def phone_stream_legacy(socket, pid, auth):
     finally:
         if connected:
             hub.disconnect(pid)
+
+
+@app.post("/sessions/{sid}/recover")
+def recover_session(sid: str):
+    if not re.fullmatch(ID, sid):
+        raise HTTPException(400, "Invalid session ID")
+    path = DATA / "sessions" / sid
+    if (
+        not path.is_dir()
+        or path.is_symlink()
+        or path.resolve().parent != (DATA / "sessions").resolve()
+    ):
+        raise HTTPException(404, "Session not found")
+
+    def work(log, stop):
+        from .recovery import recover_session as recover
+
+        with session_lock(DATA, sid):
+            if (
+                recorder
+                and recorder.config.session_id == sid
+                and (
+                    recorder.state not in {"complete", "incomplete"}
+                    or any(t.is_alive() for t in recorder.threads)
+                )
+            ):
+                raise RuntimeError(
+                    "Cannot recover a session with active acquisition threads"
+                )
+            return recover(DATA, sid, log, stop)
+
+    return jobs.submit("session-recover", work)
 
 
 @app.post("/sessions/{sid}/remove")

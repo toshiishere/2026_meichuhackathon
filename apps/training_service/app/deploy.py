@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from apps.common.schemas import ID
 from apps.common.session_lock import session_lock
 from .preprocess import packet_amplitude, packet_rows, resample_window
+from .timeline import Timeline
 
 ROOT = Path(__file__).resolve().parents[3]
 ACTIVE = {"starting", "running", "stopping"}
@@ -307,6 +308,19 @@ class Deployment:
                 base_url=os.getenv("HARDWARE_URL", "http://hardware-service:8001"),
                 timeout=10,
             )
+            timeline = None
+            if replay:
+                try:
+                    session = self.resolve_session(self.root, options.replay_session_id)
+                    checked_file(session, "raw/video.mp4")
+                    timeline = Timeline(
+                        checked_file(session, "raw/video_frames.parquet")
+                    )
+                    self.update(
+                        video_available=True, video_time_s=float(timeline.pts[0])
+                    )
+                except (ValueError, OSError, KeyError) as error:
+                    self.update(video_available=False, video_error=str(error))
             predictor = Predictor(metadata, checkpoint, classes)
             if self.stop_event.is_set():
                 return
@@ -388,6 +402,24 @@ class Deployment:
                             break
                         incoming.append(pending)
                         pending = None
+                if timeline is not None and replay_origin is not None:
+                    # Use the paced replay clock, not the last packet/prediction: video
+                    # must continue through CSI gaps and share the recording's clock.
+                    playhead = replay_origin + round(
+                        (now - replay_start) * options.replay_speed * 1e9
+                    )
+                    if ended:
+                        playhead = (
+                            int(incoming[-1]["host_timestamp_ns"])
+                            if incoming
+                            else (buffer.last_stamp or playhead)
+                        )
+                    self.update(
+                        video_time_s=timeline.video_seconds(playhead),
+                        video_playing=bool(
+                            timeline.ns[0] <= playhead < timeline.ns[-1]
+                        ),
+                    )
                 for row in incoming:
                     if buffer.add(row):
                         last_receive = now
@@ -399,6 +431,7 @@ class Deployment:
                         accepted=buffer.accepted,
                         rejected=dict(buffer.rejected),
                         source_elapsed_s=elapsed,
+                        source_timestamp_ns=buffer.last_stamp,
                     )
                     # Never keep presenting a past prediction as a current pose during a gap.
                     if now - last_receive > 0.5 / (

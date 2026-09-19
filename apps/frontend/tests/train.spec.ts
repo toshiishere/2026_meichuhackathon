@@ -7,6 +7,7 @@ test("Train selects sessions, labels, fine-tunes, auto trains and exposes result
   let active: string | null = null;
   const requests: any[] = [];
   let healthReady = true;
+  const deleted: string[] = [];
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     let data: any = [];
@@ -49,6 +50,12 @@ test("Train selects sessions, labels, fine-tunes, auto trains and exposes result
       state.jobs = [job];
       active = job.id;
       data = job;
+    }
+    if (path.includes("/remove/")) {
+      deleted.push(path.split("/").at(-1)!);
+      if (path.endsWith("/labels")) state.labels_ready = false;
+      if (path.endsWith("/model")) state.model = null;
+      data = { removed: true };
     }
     if (path.endsWith("/logs"))
       data = { logs: "Labeling → preprocessing → fine-tuning" };
@@ -110,6 +117,27 @@ test("Train selects sessions, labels, fine-tunes, auto trains and exposes result
   await page.getByLabel("Training session").selectOption("train_a");
   healthReady = false;
   await expect(page.getByText("ROCm unavailable")).toBeVisible();
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page
+    .getByRole("button", { name: "Delete labels", exact: true })
+    .click();
+  expect(deleted).toEqual([]);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page
+    .getByRole("button", { name: "Delete labels", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Delete labels", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("link", { name: "Download fine-tuned model" }),
+  ).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete model", exact: true }).click();
+  await expect(
+    page.getByRole("link", { name: "Download fine-tuned model" }),
+  ).toHaveCount(0);
+  expect(deleted).toEqual(["labels", "model"]);
   await expect(
     page.getByRole("button", { name: "Auto train", exact: true }),
   ).toBeDisabled();

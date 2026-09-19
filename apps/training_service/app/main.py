@@ -163,7 +163,9 @@ class TrainingJobs:
                 job["status"] = (
                     "cancelled"
                     if self.cancel.is_set()
-                    else "completed" if code == 0 else "failed"
+                    else "completed"
+                    if code == 0
+                    else "failed"
                 )
                 if code and not self.cancel.is_set():
                     with (folder / "job.log").open("rb") as log:
@@ -278,6 +280,59 @@ def start(sid: str, options: TrainRequest):
         return manager.submit(sid, options)
     except RuntimeError as error:
         raise HTTPException(409, str(error)) from error
+
+
+@app.post("/sessions/{sid}/remove/{artifact}")
+def remove_artifact(sid: str, artifact: str):
+    if artifact not in {"labels", "model"}:
+        raise HTTPException(404, "Unknown training artifact")
+    session_path(DATA, sid)
+    if not manager.guard.acquire(blocking=False):
+        raise HTTPException(
+            409, "Stop training or deployment before deleting artifacts"
+        )
+    try:
+        with session_lock(DATA, sid):
+            path = session_path(DATA, sid)
+            train = path / "train"
+            names = (
+                ("action_results.csv", "action_results.json")
+                if artifact == "labels"
+                else (
+                    "model.json",
+                    "finetuned_resnet18.pth",
+                    "pretrained_resnet18.pth",
+                    "classes.json",
+                    "metrics.json",
+                )
+            )
+            # Remove published copies AND historical outputs, preserving raw data,
+            # job logs/options and labels_used.csv (model provenance).
+            folders = [train] + list((train / "runs").glob("*"))
+            if (train / "runs").is_symlink():
+                raise HTTPException(400, "Training directories cannot be symlinks")
+            files = []
+            for folder in folders:
+                if folder.is_symlink() or not folder.resolve().is_relative_to(
+                    path.resolve()
+                ):
+                    raise HTTPException(400, "Unsafe training directory")
+                for name in names:
+                    for filename in (name, f".{name}.tmp"):
+                        candidate = folder / filename
+                        if candidate.is_symlink():
+                            raise HTTPException(
+                                400, "Training artifacts cannot be symlinks"
+                            )
+                        if candidate.is_file():
+                            files.append(candidate)
+            for candidate in files:
+                candidate.unlink()
+            return dict(session_id=sid, removed=artifact, files=len(files))
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+    finally:
+        manager.guard.release()
 
 
 @app.get("/jobs/{jid}/logs")

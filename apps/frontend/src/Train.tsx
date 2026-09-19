@@ -104,6 +104,24 @@ export function Train({ sessions }: { sessions: Json[] }) {
       setBusy(false);
     }
   }
+  async function removeArtifact(artifact: "labels" | "model") {
+    const description =
+      artifact === "labels"
+        ? "Delete generated labels for this session, including earlier runs? Raw recordings and model provenance are preserved."
+        : "Delete all trained model checkpoints for this session, including earlier runs? Raw recordings, labels and job logs are preserved.";
+    if (!sid || !window.confirm(description)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/sessions/${encodeURIComponent(sid)}/remove/${artifact}`, {});
+      setState(await api(`/sessions/${encodeURIComponent(sid)}`));
+      setRefresh((x) => x + 1);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
   async function cancel() {
     const job = state?.jobs?.find((j: Json) =>
       ["queued", "running"].includes(j.status),
@@ -135,7 +153,10 @@ export function Train({ sessions }: { sessions: Json[] }) {
         </div>
       )}
       {["starting", "running", "stopping"].includes(health?.deployment) && (
-        <p className="notice warning">Deployment is active. Stop it in Deploy before starting a training job.</p>
+        <p className="notice warning">
+          Deployment is active. Stop it in Deploy before starting a training
+          job.
+        </p>
       )}
       <section className="panel">
         <div className="panel-heading">
@@ -161,7 +182,7 @@ export function Train({ sessions }: { sessions: Json[] }) {
             <option value="">Choose a session</option>
             {sessions.map((s) => (
               <option key={s.session_id} value={s.session_id}>
-                {s.session_id} · {s.status}
+                {s.session_id} · {s.recovered ? "recovered" : s.status}
               </option>
             ))}
           </select>
@@ -293,6 +314,24 @@ export function Train({ sessions }: { sessions: Json[] }) {
               </>
             )}
           </div>
+          <div className="actions">
+            <button
+              className="danger"
+              disabled={
+                busy || running || !!serviceError || !state.labels_ready
+              }
+              onClick={() => void removeArtifact("labels")}
+            >
+              Delete labels
+            </button>
+            <button
+              className="danger"
+              disabled={busy || running || !!serviceError || !state.model}
+              onClick={() => void removeArtifact("model")}
+            >
+              Delete model
+            </button>
+          </div>
           {state.model && (
             <p>
               {state.model.preprocessing.windows} CSI windows ·{" "}
@@ -315,7 +354,9 @@ export function Train({ sessions }: { sessions: Json[] }) {
           )}
           <p className="hint">
             Outputs are saved in data/sessions/{sid}/train/. Raw recordings are
-            preserved. Run history retains earlier models and label files.
+            preserved. Delete buttons also remove the selected artifact type
+            from earlier runs; job logs and model label-provenance snapshots are
+            retained.
           </p>
           {state.jobs?.length > 0 && (
             <label className="field">

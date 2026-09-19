@@ -127,6 +127,9 @@ def test_replay_lifecycle_model_pinning_and_session_lock(tmp_path, monkeypatch):
     assert state["prediction"]["label"] == "Walking" and len(state["history"]) >= 2
     assert state["accepted"] == 801 and state["source_elapsed_s"] == 8
     assert state["model_run_id"] == "a" * 32
+    assert state["video_available"]
+    assert state["video_time_s"] == pytest.approx(8, abs=0.15)
+    assert state["source_timestamp_ns"] == 18_000_000_000
     with session_lock(tmp_path, session.name):
         pass
     assert not gpu_guard.locked()

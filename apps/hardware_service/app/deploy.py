@@ -19,6 +19,7 @@ class DeployCapture:
         self.stop = threading.Event()
         self.thread = None
         self.rows = deque(maxlen=2000)
+        self.frames = deque(maxlen=90)
         self.jpeg = None
         self.camera_stamp = None
         self.error = self.camera_error = None
@@ -44,6 +45,7 @@ class DeployCapture:
                 self.token = uuid.uuid4().hex
                 self.stop = threading.Event()
                 self.rows.clear()
+                self.frames.clear()
                 self.jpeg = self.camera_stamp = None
                 self.error = self.camera_error = None
                 self.dropped = self.malformed = 0
@@ -73,6 +75,7 @@ class DeployCapture:
                     if ok:
                         with self.guard:
                             self.jpeg, self.camera_stamp = jpeg.tobytes(), result[1]
+                            self.frames.append((self.jpeg, self.camera_stamp))
                 self.stop.wait(0.08)
         except Exception as error:
             with self.guard:
@@ -159,7 +162,7 @@ class DeployCapture:
                 camera_timestamp_ns=self.camera_stamp,
             )
 
-    def frame(self, token):
+    def frame(self, token, timestamp_ns=None):
         with self.guard:
             self._check(token)
             if (
@@ -170,6 +173,11 @@ class DeployCapture:
                 raise HTTPException(
                     404, self.camera_error or "Waiting for camera frame"
                 )
+            if timestamp_ns is not None:
+                frame = min(self.frames, key=lambda item: abs(item[1] - timestamp_ns))
+                if abs(frame[1] - timestamp_ns) > 500_000_000:
+                    raise HTTPException(404, "No camera frame aligned with current CSI")
+                return frame
             return self.jpeg, self.camera_stamp
 
     def close(self, token=None):

@@ -36,6 +36,10 @@ class Timeline:
             float(np.interp(seconds, self.pts, self.relative_ns))
         )
 
+    def video_seconds(self, host_ns):
+        """Map the CSI capture clock back to video PTS (also for buffered phones)."""
+        return float(np.interp(host_ns - int(self.ns[0]), self.relative_ns, self.pts))
+
     def contiguous(self, start, end, max_gap=0.5):
         left = max(0, np.searchsorted(self.pts, start, side="right") - 1)
         right = min(len(self.pts), np.searchsorted(self.pts, end, side="left") + 1)

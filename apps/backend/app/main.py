@@ -4,7 +4,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from apps.common.config import DATA
 from apps.common.schemas import (
@@ -173,6 +173,12 @@ def session_file(sid: str, filename: str):
     if not path.is_relative_to(root) or not path.is_file():
         raise HTTPException(404, "Artifact not found")
     return FileResponse(path, media_type="video/mp4" if path.suffix == ".mp4" else None)
+
+
+@app.post("/api/sessions/{sid}/recover")
+async def recover_session(sid: str):
+    validated_session(sid)
+    return (await hardware("POST", f"/sessions/{sid}/recover", json={})).json()
 
 
 @app.post("/api/manifest/rebuild")
@@ -354,6 +360,14 @@ async def start_training(sid: str, body: TrainRequest):
     )
 
 
+@app.post("/api/train/sessions/{sid}/remove/{artifact}")
+async def remove_training_artifact(sid: str, artifact: str):
+    validated_session(sid)
+    if artifact not in {"labels", "model"}:
+        raise HTTPException(404, "Unknown training artifact")
+    return await training_request("POST", f"/sessions/{sid}/remove/{artifact}", json={})
+
+
 @app.api_route("/api/train/jobs/{jid}/{action}", methods=["GET", "POST"])
 async def training_job(jid: str, action: str, request: Request):
     if not re.fullmatch(r"[a-f0-9]{32}", jid) or (request.method, action) not in {
@@ -397,10 +411,16 @@ async def deploy_stop():
 
 
 @app.get("/api/deploy/camera/{capture_id}")
-async def deploy_camera(capture_id: str):
+async def deploy_camera(
+    capture_id: str, timestamp_ns: int | None = Query(default=None, ge=0)
+):
     if not re.fullmatch(r"[a-f0-9]{32}", capture_id):
         raise HTTPException(404, "Capture not found")
-    result = await hardware("GET", f"/deploy/capture/{capture_id}/camera")
+    result = await hardware(
+        "GET",
+        f"/deploy/capture/{capture_id}/camera",
+        params={"timestamp_ns": timestamp_ns} if timestamp_ns is not None else {},
+    )
     return Response(
         result.content,
         media_type="image/jpeg",
