@@ -213,6 +213,16 @@ the shared clock) until it recovers; a receiver without enough coverage for the
 current window is listed as uncovered and the remaining receivers still produce
 a pose. Camera frames never enter this model.
 
+Deploy can send a Discord alert when a fall is followed by stillness. Put a bot
+token in `.env` as `DISCORD_BOT_TOKEN` (and optionally `DISCORD_CHANNEL_ID`);
+`make up` starts the `dc-bot` service, which holds a gateway session so the bot
+shows as online and posts the alert when deployment asks it to. The switch in
+Deploy decides whether anything is sent; falls are detected and listed either
+way. A fall alerts when Static predictions span 2 seconds within the 4 seconds after
+a Falling prediction (a stray other action in between does not reset the span),
+measured on the capture or recording's own clock — replay speed does not change it, replays alert too, and the message says
+when it came from a replay. See docs/demo-controls.md.
+
 Training and deployment cannot occupy the GPU simultaneously. Live deployment
 owns the hardware lease, preventing recording, flashing and competing previews.
 Model/replay sessions cannot be deleted or retrained while in use. If the worker

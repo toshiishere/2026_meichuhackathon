@@ -31,6 +31,7 @@ from .preprocess import (
     packet_rows,
     resample_window,
 )
+from .alerts import FallWatcher, bot_health, describe, notify
 from .playback import ensure_playable_video
 from .timeline import Timeline
 
@@ -314,6 +315,9 @@ class Deployment:
                     preprocessing=metadata["preprocessing"],
                     prediction=None,
                     history=[],
+                    notify=options.notify,
+                    falls=[],
+                    notify_error=None,
                     receiver_names=names,
                     receiver_stats=[],
                     accepted=0,
@@ -334,6 +338,47 @@ class Deployment:
             leases.close()
             self.gpu_guard.release()
             raise
+
+    def set_notify(self, enabled):
+        """The operator decides whether a detected fall leaves this machine."""
+        failure = None
+        if enabled:
+            try:
+                bot_health()
+            except Exception as error:
+                # Say now that alerts cannot be delivered, not after a fall.
+                failure = str(error)
+        self.update(notify=bool(enabled), notify_error=failure)
+        return self.snapshot()
+
+    def _record_fall(self, options, fell_at, held, receivers):
+        detail = describe(fell_at, held, options, receivers)
+        event = dict(
+            fell_at_s=round(fell_at, 2),
+            still_seconds=round(held, 2),
+            detail=detail,
+            notified=False,
+            error=None,
+        )
+        with self.guard:
+            self.state["falls"] = self.state.get("falls", [])[-9:] + [event]
+            enabled = bool(self.state.get("notify"))
+        if not enabled:
+            return
+
+        def send():
+            try:
+                notify("falling", detail)
+                with self.guard:
+                    event["notified"] = True
+                    self.state["notify_error"] = None
+            except Exception as error:
+                # An unreachable bot must never interrupt inference.
+                with self.guard:
+                    event["error"] = str(error)
+                    self.state["notify_error"] = str(error)
+
+        threading.Thread(target=send, daemon=True).start()
 
     def stop(self):
         with self.guard:
@@ -398,6 +443,7 @@ class Deployment:
                 name: WindowBuffer(prep["window_seconds"], prep["sample_rate_hz"])
                 for name in names
             }
+            watcher = FallWatcher()
             duration = buffers[names[0]].duration
             stride = max(100_000_000, round(duration * (1 - prep["overlap"])))
             if options.source == "live" or options.camera:
@@ -587,6 +633,11 @@ class Deployment:
                                 signal="ready", prediction=prediction, history=history
                             )
                             last_predict = end
+                            # Source seconds, so a replay at any speed alerts at
+                            # the same point of the recording as a live capture.
+                            fall = watcher.observe(prediction["label"], elapsed)
+                            if fall:
+                                self._record_fall(options, *fall, fused)
                 else:
                     self.update(signal="waiting_for_supported_csi")
                 if ended:

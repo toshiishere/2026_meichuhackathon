@@ -95,3 +95,43 @@ list. The UI labels them **recovered**. Original errors and acquisition
 statistics remain intact: recovered does not mean good-quality data. Active
 acquisition threads and busy sessions cannot be recovered. No existing session
 is recovered or deleted automatically.
+
+## Fall alerts to Discord
+
+`make up` starts a `dc-bot` service alongside the collector. It holds a Discord
+gateway session, which is what makes a bot appear **online** — REST calls alone
+leave it grey — and exposes `POST /alert` on the internal network for the
+deployment worker, plus `GET /health` reporting whether it is connected. The
+token comes from `DISCORD_BOT_TOKEN` in `.env` (never from a source file) and
+`DISCORD_CHANNEL_ID` overrides the default channel. A token Discord rejects is
+reported once and not retried, because retrying a rejected token earns a rate
+limit; fix `.env` and restart the service. Changing the token requires
+recreating the container (`make up` does this).
+
+Deploy has a **Send a Discord alert when a fall is detected** switch. It can be
+turned on before starting and flipped during a run; turning it on asks the bot
+whether it is online and says so immediately rather than staying silent until a
+fall happens. Falls are always detected and listed in the Deploy panel — the
+switch only decides whether anything leaves this machine.
+
+The rule, applied to the fused pose predictions:
+
+- a prediction labelled **Falling** starts a four-second watch;
+- inside that watch, stillness is the span from the first **Static** prediction
+  after the fall to the latest one, and must reach two seconds. A stray
+  prediction of another action in between does not cancel it; a second fall
+  restarts the watch;
+- one alert per fall, with a 30-second cooldown.
+
+Because interruptions do not reset the span, a couple of noisy predictions
+between two Static ones still count as stillness — deliberately tolerant, so a
+real fall is not missed for one flickering window.
+
+Every one of those times is a **source** time — seconds along the live capture,
+or along the recording being replayed. Replay speed is not involved, so a
+recording replayed at 4x raises the same alerts, at the same points of the
+recording, as it would at 1x. Recorded replays do alert, and their message says
+which session was replayed so nobody reads a demo as a live emergency. The
+message itself is the bot's existing wording, with the detection detail
+appended. A failed or refused send is reported in Deploy and never interrupts
+inference.

@@ -14,6 +14,7 @@ from apps.common.schemas import (
     RemoveDeviceRequest,
     TrainRequest,
     DeployRequest,
+    NotifyRequest,
 )
 from apps.common.storage import Registry, scan_sessions, read_session, rebuild_manifest
 
@@ -415,6 +416,13 @@ async def deploy_start(body: DeployRequest):
 @app.post("/api/deploy/stop")
 async def deploy_stop():
     return await training_request("POST", "/deploy/stop")
+
+
+@app.post("/api/deploy/notify")
+async def deploy_notify(body: NotifyRequest):
+    return await training_request(
+        "POST", "/deploy/notify", json=body.model_dump()
+    )
 
 
 @app.get("/api/deploy/camera/{capture_id}")

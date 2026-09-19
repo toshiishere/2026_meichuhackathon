@@ -12,6 +12,7 @@ services:
     environment:
       DATA_DIR: /data
       HARDWARE_URL: http://hardware-service:8001
+      NOTIFIER_URL: http://dc-bot:8003
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri

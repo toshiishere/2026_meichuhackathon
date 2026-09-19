@@ -51,6 +51,7 @@ export function Deploy({
   const [speed, setSpeed] = useState(1);
   const [baud, setBaud] = useState(921600);
   const [cameraDevice, setCameraDevice] = useState("");
+  const [notify, setNotify] = useState(false);
   const [error, setError] = useState("");
   const [serviceError, setServiceError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -130,6 +131,7 @@ export function Deploy({
           setSpeed(o.replay_speed);
           setBaud(o.baud_rate);
           setCameraDevice(o.camera?.device || "");
+          setNotify(!!value.notify);
         }
         initialized.current = true;
       } catch (e) {
@@ -295,12 +297,24 @@ export function Deploy({
         replay_speed: speed,
         baud_rate: baud,
         camera: cameraConfig,
+        notify,
       });
       setState(result);
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setBusy(false);
+    }
+  }
+  async function setAlerts(enabled: boolean) {
+    setNotify(enabled);
+    if (!running) return;
+    // A running deployment is the worker's, not this page's: tell it directly.
+    try {
+      setState(await api("/notify", { enabled }));
+    } catch (e) {
+      setError((e as Error).message);
+      setNotify(!enabled);
     }
   }
   async function stop() {
@@ -524,6 +538,21 @@ export function Deploy({
             paired phone link.
           </p>
         )}
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            aria-label="Send a Discord alert when a fall is detected"
+            checked={notify}
+            disabled={busy}
+            onChange={(e) => void setAlerts(e.target.checked)}
+          />
+          <span>
+            Send a Discord alert when a fall is followed by 2 s of stillness
+            within 4 s. Measured on the recording’s own clock, so replay speed
+            does not change when an alert fires — replays alert too, and say so
+            in the message.
+          </span>
+        </label>
         <div className="actions">
           <button
             className="primary"
@@ -729,6 +758,43 @@ export function Deploy({
               </p>
             )}
           </>
+        )}
+        {state.notify_error && (
+          <p className="notice warning">
+            Discord alert could not be sent: {state.notify_error}
+          </p>
+        )}
+        {!!state.falls?.length && (
+          <details open>
+            <summary>
+              Falls detected ({state.falls.length}
+              {state.notify ? "" : "; alerts off"})
+            </summary>
+            <table>
+              <thead>
+                <tr>
+                  <th>Fall at</th>
+                  <th>Stillness</th>
+                  <th>Discord alert</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...state.falls].reverse().map((f: Json, i: number) => (
+                  <tr key={i}>
+                    <td>{f.fell_at_s.toFixed(1)}s</td>
+                    <td>{f.still_seconds.toFixed(1)}s</td>
+                    <td>
+                      {f.notified
+                        ? "sent"
+                        : f.error
+                          ? `failed: ${f.error}`
+                          : "not sent"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </details>
         )}
         {!!state.history?.length && (
           <details>

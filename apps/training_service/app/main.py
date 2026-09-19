@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from apps.common.config import DATA
-from apps.common.schemas import ID, TrainRequest, DeployRequest
+from apps.common.schemas import ID, TrainRequest, DeployRequest, NotifyRequest
 from .deploy import Deployment
 from apps.common.session_lock import session_lock
 from apps.common.storage import Registry, atomic_json, utc_now
@@ -242,6 +242,11 @@ def deployment_start(options: DeployRequest):
 @app.post("/deploy/stop")
 def deployment_stop():
     return deployment.stop()
+
+
+@app.post("/deploy/notify")
+def deployment_notify(body: NotifyRequest):
+    return deployment.set_notify(body.enabled)
 
 
 @app.get("/sessions/{sid}")

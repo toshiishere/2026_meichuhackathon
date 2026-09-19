@@ -147,3 +147,9 @@ once into the session's `derived/video.mp4` (raw data untouched) and the browser
 is pointed at whichever file carries an index. Labels/video are not used as inference inputs. The UI polls
 deployment status and camera images separately; a lost UI connection hides its
 current prediction but does not stop deployment.
+
+Fall alerting runs in the worker, not the browser, so a replay alerts with no UI
+attached. It watches the fused predictions on the source clock and posts to the
+`dc-bot` service, which owns the Discord gateway session and the bot token; the
+worker holds no credentials, and a send failure is recorded in deployment status
+without touching the inference loop.

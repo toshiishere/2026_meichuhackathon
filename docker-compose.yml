@@ -54,3 +54,16 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+  dc-bot:
+    build:
+      context: .
+      dockerfile: docker/dc-bot.Dockerfile
+    environment:
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8003/health")']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped

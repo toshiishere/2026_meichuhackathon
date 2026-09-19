@@ -160,6 +160,7 @@ class DeployRequest(Strict):
     replay_speed: float = Field(default=1, ge=0.25, le=4)
     camera: CameraConfig | None = None
     baud_rate: int = Field(default=DEFAULTS["baud_rate"], ge=9600, le=3000000)
+    notify: bool = False
 
     @model_validator(mode="after")
     def valid_source(self):
@@ -173,3 +174,7 @@ class DeployRequest(Strict):
             if len(set(self.replay_receivers)) != len(self.replay_receivers):
                 raise ValueError("Replay receivers must be distinct")
         return self
+
+
+class NotifyRequest(Strict):
+    enabled: bool
