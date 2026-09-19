@@ -97,6 +97,18 @@ def packet_rows(path):
             yield from reader
 
 
+def normalize_window(amplitudes):
+    """Per-window global z-score, as the training loader applies it.
+
+    Mirrors load_mat_amplitude in csi_model/finetune/session_tools/finetune.py;
+    keep the two together. scipy's MAT loader hands training column-major
+    arrays, so reducing in that order keeps a live window numerically identical
+    to the ones the saved model was trained on.
+    """
+    x = np.asfortranarray(amplitudes)
+    return ((x - np.mean(x)) / (np.std(x) + 1e-8)).astype(np.float32)
+
+
 def resample_window(stamps, amplitudes, lo, hi, size):
     """Reject gaps/low coverage, then interpolate onto the model's uniform clock."""
     stamps = np.asarray(stamps, dtype=np.int64)

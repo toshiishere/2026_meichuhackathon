@@ -1,4 +1,11 @@
-"""Session model inference using the training feature path and timestamped CSI."""
+"""Session model inference using the training feature path and timestamped CSI.
+
+Training hands every receiver's window for one moment to the same single-link
+backbone (`receiver_mode: shared single-link backbone; each receiver is an
+example`). Deployment therefore runs all selected receivers over one common
+window and fuses their class probabilities into a single pose, rather than
+picking one link and discarding the rest.
+"""
 
 from collections import Counter, deque
 from contextlib import ExitStack
@@ -18,11 +25,19 @@ from fastapi import HTTPException
 
 from apps.common.schemas import ID
 from apps.common.session_lock import session_lock
-from .preprocess import packet_amplitude, packet_rows, resample_window
+from .preprocess import (
+    normalize_window,
+    packet_amplitude,
+    packet_rows,
+    resample_window,
+)
 from .timeline import Timeline
 
 ROOT = Path(__file__).resolve().parents[3]
 ACTIVE = {"starting", "running", "stopping"}
+# A receiver silent for longer than this is dropped from the fused window
+# instead of holding the shared clock (and the camera) back.
+STALE_SECONDS = 0.5
 
 
 def checked_file(session, relative):
@@ -77,6 +92,32 @@ def replay_files(session):
     return files
 
 
+def fuse_scores(names, probabilities, classes):
+    """One pose from every receiver: mean of the per-receiver class scores.
+
+    Each receiver observes the same moment through the same trained backbone,
+    so its softmax vector is one opinion about that moment; averaging them is
+    the deployment counterpart of training on every receiver's windows.
+    """
+    mean = probabilities.mean(axis=0)
+    index = int(mean.argmax())
+    return dict(
+        label=classes[index],
+        confidence=float(mean[index]),
+        scores={label: float(score) for label, score in zip(classes, mean)},
+        receivers=[
+            dict(
+                receiver=name,
+                label=classes[int(scores.argmax())],
+                confidence=float(scores.max()),
+                scores={label: float(score) for label, score in zip(classes, scores)},
+            )
+            for name, scores in zip(names, probabilities)
+        ],
+        fused_receivers=list(names),
+    )
+
+
 class WindowBuffer:
     def __init__(self, window_seconds, sample_rate_hz):
         self.duration = round(window_seconds * 1e9)
@@ -96,7 +137,9 @@ class WindowBuffer:
             self.last_stamp = stamp
             self.rows.append((stamp, amp))
             self.accepted += 1
-            cutoff = stamp - self.duration - 300_000_000
+            # A second of slack: a receiver running ahead of the shared window
+            # end must keep the rows that window still needs.
+            cutoff = stamp - self.duration - 1_000_000_000
             while len(self.rows) > 2 and self.rows[1][0] < cutoff:
                 self.rows.popleft()
             return True
@@ -111,13 +154,13 @@ class WindowBuffer:
             ] += 1
             return False
 
-    def window(self):
+    def window(self, end=None):
+        """The window ending at `end` on the shared clock, or None if uncovered."""
         if not self.rows:
             return None
+        end = self.last_stamp if end is None else end
         stamps, amps = zip(*self.rows)
-        return resample_window(
-            stamps, amps, stamps[-1] - self.duration, stamps[-1], self.size
-        )
+        return resample_window(stamps, amps, end - self.duration, end, self.size)
 
 
 class Predictor:
@@ -136,9 +179,8 @@ class Predictor:
         sys.path.insert(0, str(ROOT / "csi_model/Model Code"))
         sys.path.insert(0, str(ROOT / "csi_model/finetune/session_tools"))
         from ESP_Fi_model import ESP_Fi_ResNet18
-        from finetune import normalize_amplitude
 
-        self.torch, self.normalize, self.classes = torch, normalize_amplitude, classes
+        self.torch, self.normalize, self.classes = torch, normalize_window, classes
         self.model = ESP_Fi_ResNet18(num_classes=len(classes))
         self.model.load_state_dict(
             torch.load(checkpoint, map_location="cpu", weights_only=True), strict=True
@@ -147,31 +189,29 @@ class Predictor:
             self.model.to("cuda:0").eval()
             # Compile/warm GPU kernels before taking ownership of live hardware.
             prep = metadata["preprocessing"]
-            self.predict(
-                np.zeros(
-                    (round(prep["window_seconds"] * prep["sample_rate_hz"]), 52),
-                    dtype=np.float32,
-                )
+            self.scores(
+                [
+                    np.zeros(
+                        (round(prep["window_seconds"] * prep["sample_rate_hz"]), 52),
+                        dtype=np.float32,
+                    )
+                ]
             )
         except Exception:
             self.close()
             raise
 
-    def predict(self, amplitudes):
+    def scores(self, windows):
+        """One batched forward over every receiver's window for this moment."""
         torch = self.torch
         began = time.monotonic()
-        x = torch.from_numpy(self.normalize(amplitudes)[None, None]).to("cuda:0")
+        batch = np.stack([self.normalize(window) for window in windows])[:, None]
+        x = torch.from_numpy(np.ascontiguousarray(batch)).to("cuda:0")
         with torch.inference_mode():
-            scores = self.model(x).softmax(dim=1)[0].cpu().numpy()
-        if not np.isfinite(scores).all():
+            probabilities = self.model(x).softmax(dim=1).cpu().numpy()
+        if not np.isfinite(probabilities).all():
             raise RuntimeError("Model produced non-finite scores")
-        index = int(scores.argmax())
-        return dict(
-            label=self.classes[index],
-            confidence=float(scores[index]),
-            scores={label: float(score) for label, score in zip(self.classes, scores)},
-            inference_ms=(time.monotonic() - began) * 1000,
-        )
+        return probabilities, (time.monotonic() - began) * 1000
 
     def close(self):
         self.model = None
@@ -247,15 +287,20 @@ class Deployment:
                     raise ValueError("Choose completed sessions for deployment")
             session = self.resolve_session(self.root, options.model_session_id)
             metadata, checkpoint, classes = model_artifacts(session)
-            replay = None
+            replays = {}
             if options.source == "replay":
-                replay = replay_files(
+                available = replay_files(
                     self.resolve_session(self.root, options.replay_session_id)
-                ).get(options.replay_receiver)
-                if replay is None:
+                )
+                missing = [r for r in options.replay_receivers if r not in available]
+                if missing:
                     raise ValueError(
-                        "Replay receiver not found in the selected session"
+                        f"Replay receivers not found in the selected session: {', '.join(missing)}"
                     )
+                replays = {r: available[r] for r in options.replay_receivers}
+                names = list(replays)
+            else:
+                names = [r.logical_name for r in options.receivers]
             self.stop_event = threading.Event()
             with self.guard:
                 self.state = dict(
@@ -268,6 +313,8 @@ class Deployment:
                     preprocessing=metadata["preprocessing"],
                     prediction=None,
                     history=[],
+                    receiver_names=names,
+                    receiver_stats=[],
                     accepted=0,
                     rejected={},
                     source_elapsed_s=0,
@@ -277,7 +324,7 @@ class Deployment:
                 )
             self.thread = threading.Thread(
                 target=self._run,
-                args=(options, metadata, checkpoint, classes, replay, leases),
+                args=(options, metadata, checkpoint, classes, replays, leases),
                 daemon=True,
             )
             self.thread.start()
@@ -299,7 +346,7 @@ class Deployment:
         if self.thread:
             self.thread.join(timeout=15)
 
-    def _run(self, options, metadata, checkpoint, classes, replay, leases):
+    def _run(self, options, metadata, checkpoint, classes, replays, leases):
         capture_id, predictor = None, None
         client = None
         final_status, failure = "stopped", None
@@ -309,7 +356,7 @@ class Deployment:
                 timeout=10,
             )
             timeline = None
-            if replay:
+            if replays:
                 try:
                     session = self.resolve_session(self.root, options.replay_session_id)
                     checked_file(session, "raw/video.mp4")
@@ -325,16 +372,25 @@ class Deployment:
             if self.stop_event.is_set():
                 return
             prep = metadata["preprocessing"]
-            buffer = WindowBuffer(prep["window_seconds"], prep["sample_rate_hz"])
-            stride = max(100_000_000, round(buffer.duration * (1 - prep["overlap"])))
+            names = (
+                list(replays)
+                if options.source == "replay"
+                else [r.logical_name for r in options.receivers]
+            )
+            buffers = {
+                name: WindowBuffer(prep["window_seconds"], prep["sample_rate_hz"])
+                for name in names
+            }
+            duration = buffers[names[0]].duration
+            stride = max(100_000_000, round(duration * (1 - prep["overlap"])))
             if options.source == "live" or options.camera:
                 response = client.post(
                     "/deploy/capture",
                     json=dict(
-                        receiver=(
-                            options.receiver.model_dump()
+                        receivers=(
+                            [r.model_dump() for r in options.receivers]
                             if options.source == "live"
-                            else None
+                            else []
                         ),
                         camera=options.camera.model_dump() if options.camera else None,
                         baud_rate=options.baud_rate,
@@ -351,15 +407,28 @@ class Deployment:
                 capture_id = response.json()["capture_id"]
                 self.update(capture_id=capture_id)
             self.update(status="running")
-            origin, last_predict, last_receive = None, None, time.monotonic()
+            origin, last_predict = None, None
+            last_receive = {name: time.monotonic() for name in names}
             last_poll = 0
             replay_start = time.monotonic()
             replay_origin = None
-            rows = iter(packet_rows(replay)) if replay else None
-            pending = None
+            # Peek every replay file so all receivers share one replay origin:
+            # the recording's own clock stays the common window clock.
+            rows, pending, done = {}, {}, {}
+            for name, path in replays.items():
+                rows[name] = packet_rows(path)
+                pending[name] = next(rows[name], None)
+                done[name] = pending[name] is None
+                try:
+                    stamp = int(pending[name]["host_timestamp_ns"])
+                    replay_origin = (
+                        stamp if replay_origin is None else min(replay_origin, stamp)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
             ended = False
             while not self.stop_event.is_set():
-                incoming = []
+                incoming = {name: [] for name in names}
                 now = time.monotonic()
                 if capture_id and now - last_poll >= 0.1:
                     response = client.get(f"/deploy/capture/{capture_id}/packets")
@@ -371,26 +440,28 @@ class Deployment:
                         )
                     self.update(
                         camera_error=batch.get("camera_error"),
-                        transport_dropped=batch["dropped"],
-                        malformed_packets=batch["malformed"],
+                        receiver_errors=batch.get("receiver_errors") or {},
+                        transport_dropped=sum(batch["dropped"].values()),
+                        malformed_packets=sum(batch["malformed"].values()),
                     )
                     if options.source == "live":
-                        incoming = batch["rows"]
+                        for name, batch_rows in batch["rows"].items():
+                            if name in incoming:
+                                incoming[name].extend(batch_rows)
                     last_poll = now
-                if rows:
+                for name, iterator in rows.items():
                     # Pace by original host timestamps, including gaps; memory stays bounded.
                     for _ in range(500):
-                        if pending is None:
-                            try:
-                                pending = next(rows)
-                            except StopIteration:
-                                ended = True
+                        if pending[name] is None:
+                            pending[name] = next(iterator, None)
+                            if pending[name] is None:
+                                done[name] = True
                                 break
                         try:
-                            stamp = int(pending["host_timestamp_ns"])
-                        except (ValueError, TypeError, KeyError):
-                            buffer.rejected["malformed"] += 1
-                            pending = None
+                            stamp = int(pending[name]["host_timestamp_ns"])
+                        except (KeyError, ValueError, TypeError):
+                            buffers[name].rejected["malformed"] += 1
+                            pending[name] = None
                             continue
                         if replay_origin is None:
                             replay_origin = stamp
@@ -400,51 +471,84 @@ class Deployment:
                         )
                         if due > now:
                             break
-                        incoming.append(pending)
-                        pending = None
+                        incoming[name].append(pending[name])
+                        pending[name] = None
+                ended = bool(rows) and all(done.values())
+                for name, batch_rows in incoming.items():
+                    for row in batch_rows:
+                        if buffers[name].add(row):
+                            last_receive[name] = now
+                            if origin is None:
+                                origin = buffers[name].last_stamp
                 if timeline is not None and replay_origin is not None:
                     # Use the paced replay clock, not the last packet/prediction: video
                     # must continue through CSI gaps and share the recording's clock.
                     playhead = replay_origin + round(
                         (now - replay_start) * options.replay_speed * 1e9
                     )
-                    if ended:
-                        playhead = (
-                            int(incoming[-1]["host_timestamp_ns"])
-                            if incoming
-                            else (buffer.last_stamp or playhead)
-                        )
+                    stamps = [b.last_stamp for b in buffers.values() if b.last_stamp]
+                    if ended and stamps:
+                        playhead = max(stamps)
                     self.update(
                         video_time_s=timeline.video_seconds(playhead),
                         video_playing=bool(
                             timeline.ns[0] <= playhead < timeline.ns[-1]
                         ),
                     )
-                for row in incoming:
-                    if buffer.add(row):
-                        last_receive = now
-                        if origin is None:
-                            origin = buffer.last_stamp
-                if buffer.last_stamp is not None:
-                    elapsed = (buffer.last_stamp - origin) / 1e9
+                stale = STALE_SECONDS / (options.replay_speed if replays else 1)
+                live = [
+                    name
+                    for name in names
+                    if buffers[name].last_stamp is not None
+                    and now - last_receive[name] <= stale
+                ]
+                rejected = Counter()
+                for buffer in buffers.values():
+                    rejected.update(buffer.rejected)
+                self.update(
+                    accepted=sum(b.accepted for b in buffers.values()),
+                    rejected=dict(rejected),
+                    receiver_stats=[
+                        dict(
+                            receiver=name,
+                            accepted=buffers[name].accepted,
+                            rejected=dict(buffers[name].rejected),
+                            live=name in live,
+                            last_timestamp_ns=buffers[name].last_stamp,
+                        )
+                        for name in names
+                    ],
+                )
+                if any(b.last_stamp is not None for b in buffers.values()):
+                    # One window end shared by every live receiver: the fused
+                    # pose, the elapsed clock and the camera all use this time.
+                    end = (
+                        min(buffers[name].last_stamp for name in live)
+                        if live
+                        else max(b.last_stamp for b in buffers.values() if b.last_stamp)
+                    )
+                    elapsed = (end - origin) / 1e9
                     self.update(
-                        accepted=buffer.accepted,
-                        rejected=dict(buffer.rejected),
                         source_elapsed_s=elapsed,
-                        source_timestamp_ns=buffer.last_stamp,
+                        source_timestamp_ns=end,
                     )
                     # Never keep presenting a past prediction as a current pose during a gap.
-                    if now - last_receive > 0.5 / (
-                        options.replay_speed if replay else 1
-                    ):
+                    if not live:
                         self.update(signal="no_data", prediction=None)
                     elif (
                         last_predict is None
-                        or buffer.last_stamp - last_predict >= stride
-                        or (ended and buffer.last_stamp != last_predict)
+                        or end - last_predict >= stride
+                        or (ended and end != last_predict)
                     ):
-                        amp = buffer.window()
-                        if amp is None:
+                        fused, windows, uncovered = [], [], []
+                        for name in live:
+                            amplitudes = buffers[name].window(end)
+                            if amplitudes is None:
+                                uncovered.append(name)
+                            else:
+                                fused.append(name)
+                                windows.append(amplitudes)
+                        if not windows:
                             signal = (
                                 "warming_up"
                                 if elapsed < prep["window_seconds"]
@@ -452,24 +556,27 @@ class Deployment:
                             )
                             self.update(signal=signal, prediction=None)
                         else:
-                            prediction = predictor.predict(amp)
+                            probabilities, inference_ms = predictor.scores(windows)
+                            prediction = fuse_scores(fused, probabilities, classes)
                             prediction.update(
-                                window_start_ns=buffer.last_stamp - buffer.duration,
-                                window_end_ns=buffer.last_stamp,
+                                window_start_ns=end - duration,
+                                window_end_ns=end,
                                 source_elapsed_s=elapsed,
+                                inference_ms=inference_ms,
+                                uncovered_receivers=uncovered,
                             )
                             history = self.snapshot()["history"][-29:] + [prediction]
                             self.update(
                                 signal="ready", prediction=prediction, history=history
                             )
-                            last_predict = buffer.last_stamp
+                            last_predict = end
                 else:
-                    self.update(
-                        rejected=dict(buffer.rejected),
-                        signal="waiting_for_supported_csi",
-                    )
+                    self.update(signal="waiting_for_supported_csi")
                 if ended:
-                    if not buffer.accepted or not self.snapshot()["history"]:
+                    if (
+                        not any(b.accepted for b in buffers.values())
+                        or not self.snapshot()["history"]
+                    ):
                         raise ValueError(
                             "Replay contains no usable model windows; check packet layout and coverage"
                         )

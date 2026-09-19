@@ -19,6 +19,13 @@ async function api(path: string, body?: Json) {
   );
 }
 
+const toggle = (values: string[], value: string, on: boolean) =>
+  on
+    ? values.includes(value)
+      ? values
+      : [...values, value]
+    : values.filter((v) => v !== value);
+
 export function Deploy({
   boards,
   ports,
@@ -39,49 +46,21 @@ export function Deploy({
   const [model, setModel] = useState("");
   const [source, setSource] = useState("replay");
   const [replay, setReplay] = useState("");
-  const [replayReceiver, setReplayReceiver] = useState("");
-  const [receiver, setReceiver] = useState("");
+  const [replayReceivers, setReplayReceivers] = useState<string[]>([]);
+  const [liveReceivers, setLiveReceivers] = useState<string[]>([]);
   const [speed, setSpeed] = useState(1);
   const [baud, setBaud] = useState(921600);
   const [cameraDevice, setCameraDevice] = useState("");
   const [error, setError] = useState("");
   const [serviceError, setServiceError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [tick, setTick] = useState(0);
-  const [previewReady, setPreviewReady] = useState(false);
   const initialized = useRef(false);
   const video = useRef<HTMLVideoElement>(null);
   const [videoError, setVideoError] = useState("");
-  useEffect(() => {
-    const player = video.current;
-    if (!player) return;
-    const sync = () => {
-      const position = state.video_time_s;
-      player.playbackRate = state.options?.replay_speed || 1;
-      const playing =
-        state.status === "running" &&
-        state.video_playing !== false &&
-        !serviceError;
-      if (
-        Number.isFinite(position) &&
-        Math.abs(player.currentTime - position) > (playing ? 0.25 : 0.02)
-      )
-        player.currentTime = position;
-      if (playing) {
-        void player.play().catch((error: DOMException) => {
-          if (error.name !== "AbortError")
-            setVideoError(
-              "Video playback could not start. Check browser autoplay settings.",
-            );
-        });
-      } else {
-        player.pause();
-      }
-    };
-    sync();
-    player.addEventListener("loadedmetadata", sync);
-    return () => player.removeEventListener("loadedmetadata", sync);
-  }, [state, serviceError]);
+  // Half of the status round trip: the reported playhead is already that old.
+  const latency = useRef(0);
+  const playhead = useRef({ position: NaN, at: 0, rate: 1, playing: false });
+  const drift = useRef(0);
   const running = active(state.status);
   const receivers = boards.filter(
     (b) =>
@@ -90,7 +69,7 @@ export function Deploy({
   const selectedModel = catalog.models.find(
     (m: Json) => m.session_id === model,
   );
-  const replayReceivers =
+  const sessionReceivers: string[] =
     catalog.sources.find((s: Json) => s.session_id === replay)?.receivers || [];
 
   async function refreshCatalog() {
@@ -109,30 +88,39 @@ export function Deploy({
   }, []);
   useEffect(() => {
     if (running) return;
-    setReplayReceiver((old) =>
-      replayReceivers.includes(old) ? old : replayReceivers[0] || "",
-    );
+    // Fusing every recorded receiver is the default: that is what training saw.
+    setReplayReceivers((old) => {
+      const kept = old.filter((name) => sessionReceivers.includes(name));
+      return kept.length ? kept : sessionReceivers;
+    });
   }, [replay, catalog, running]);
   useEffect(() => {
-    setReceiver((old) => old || receivers[0]?.identity || "");
-  }, [boards, ports]);
+    if (running) return;
+    setLiveReceivers((old) => {
+      const kept = old.filter((id) => receivers.some((b) => b.identity === id));
+      return kept.length ? kept : receivers.map((b) => b.identity);
+    });
+  }, [boards, ports, running]);
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
+        const began = performance.now();
         const value = await api("/status");
         if (!alive) return;
+        latency.current = performance.now() - began;
         setState(value);
-        setTick((t) => t + 1);
         setServiceError("");
         if (!initialized.current && active(value.status) && value.options) {
           const o = value.options;
           setModel(o.model_session_id);
           setSource(o.source);
           setReplay(o.replay_session_id || "");
-          setReplayReceiver(o.replay_receiver || "");
-          setReceiver(o.receiver?.identity || "");
+          setReplayReceivers(o.replay_receivers || []);
+          setLiveReceivers(
+            (o.receivers || []).map((r: Json) => r.identity).filter(Boolean),
+          );
           setSpeed(o.replay_speed);
           setBaud(o.baud_rate);
           setCameraDevice(o.camera?.device || "");
@@ -150,16 +138,130 @@ export function Deploy({
       clearTimeout(timer);
     };
   }, []);
+
+  // Recorded video: track the worker's playhead continuously instead of
+  // replaying a status sample that is already a round trip old.
+  useEffect(() => {
+    playhead.current = {
+      position: Number(state.video_time_s),
+      at: performance.now() - latency.current / 2,
+      rate: state.options?.replay_speed || 1,
+      playing:
+        state.status === "running" &&
+        state.video_playing !== false &&
+        !serviceError,
+    };
+  }, [state, serviceError]);
+  useEffect(() => {
+    const player = video.current;
+    if (!player) return;
+    const sync = () => {
+      const { position, at, rate, playing } = playhead.current;
+      if (Number.isFinite(position)) {
+        const expected = playing
+          ? position + ((performance.now() - at) / 1000) * rate
+          : position;
+        drift.current = expected - player.currentTime;
+        if (Math.abs(drift.current) > (playing ? 0.35 : 0.02)) {
+          player.currentTime = expected;
+          player.playbackRate = rate;
+        } else if (playing) {
+          // Absorb small drift through the rate; seeking every poll stutters.
+          const trim = Math.max(-0.1, Math.min(0.1, drift.current * 0.5));
+          player.playbackRate = Math.max(0.1, rate * (1 + trim));
+        } else {
+          player.playbackRate = rate;
+        }
+      }
+      if (playing) {
+        void player.play().catch((e: DOMException) => {
+          if (e.name !== "AbortError")
+            setVideoError(
+              "Video playback could not start. Check browser autoplay settings.",
+            );
+        });
+      } else {
+        player.pause();
+      }
+    };
+    sync();
+    const timer = window.setInterval(sync, 100);
+    player.addEventListener("loadedmetadata", sync);
+    return () => {
+      window.clearInterval(timer);
+      player.removeEventListener("loadedmetadata", sync);
+    };
+  }, [state.video_available, state.id]);
+
+  // Live camera: ask for the frame captured at the fused CSI clock — the end
+  // of the window every live receiver covers — and report the real offset.
+  const [preview, setPreview] = useState<Json | null>(null);
+  const align = useRef<number | null>(null);
+  const objectUrl = useRef("");
+  useEffect(() => {
+    align.current =
+      state.source_timestamp_ns || state.prediction?.window_end_ns || null;
+  }, [state]);
+  const liveCamera = !!(state.capture_id && state.options?.camera);
+  useEffect(() => {
+    if (!liveCamera) {
+      setPreview(null);
+      return;
+    }
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const show = (value: Json | null) => {
+      if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
+      objectUrl.current = value?.url || "";
+      setPreview(value);
+    };
+    async function load() {
+      try {
+        const timestamp = align.current;
+        const response = await fetch(
+          `/api/deploy/camera/${state.capture_id}` +
+            (timestamp ? `?timestamp_ns=${timestamp}` : ""),
+          { cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(String(response.status));
+        const stamp = Number(response.headers.get("X-Host-Timestamp-Ns"));
+        const blob = await response.blob();
+        if (!alive) return;
+        show({
+          url: URL.createObjectURL(blob),
+          skew:
+            timestamp && Number.isFinite(stamp)
+              ? (stamp - timestamp) / 1e6
+              : null,
+        });
+      } catch {
+        if (alive) show(null);
+      } finally {
+        if (alive) timer = setTimeout(load, 100);
+      }
+    }
+    void load();
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
+      objectUrl.current = "";
+    };
+  }, [liveCamera, state.capture_id]);
+
   async function start() {
     setBusy(true);
     setError("");
-    setPreviewReady(false);
     setVideoError("");
     try {
-      const b = receivers.find((x) => x.identity === receiver);
-      const p = ports.find((x) => x.identity === receiver);
-      if (source === "live" && (!b || !p))
-        throw new Error("Receiver disconnected; refresh hardware.");
+      const selected = liveReceivers
+        .map((identity) => ({
+          board: receivers.find((x) => x.identity === identity),
+          port: ports.find((x) => x.identity === identity),
+        }))
+        .filter((x) => x.board && x.port);
+      if (source === "live" && selected.length !== liveReceivers.length)
+        throw new Error("A selected receiver is disconnected; refresh hardware.");
       const selectedCamera = cameras.find((c) => c.device === cameraDevice);
       const cameraConfig =
         source === "live" && cameraDevice
@@ -174,16 +276,16 @@ export function Deploy({
       const result = await api("/start", {
         model_session_id: model,
         source,
-        receiver:
-          source === "live" && b && p
-            ? {
-                identity: b.identity,
-                logical_name: b.logical_name,
-                port: p.port,
-              }
-            : null,
+        receivers:
+          source === "live"
+            ? selected.map(({ board, port }) => ({
+                identity: board!.identity,
+                logical_name: board!.logical_name,
+                port: port!.port,
+              }))
+            : [],
         replay_session_id: source === "replay" ? replay : null,
-        replay_receiver: source === "replay" ? replayReceiver : null,
+        replay_receivers: source === "replay" ? replayReceivers : [],
         replay_speed: speed,
         baud_rate: baud,
         camera: cameraConfig,
@@ -213,6 +315,7 @@ export function Deploy({
     insufficient_data: "Not enough CSI coverage. Check packet rate and gaps.",
     no_data: "CSI stream paused. Waiting for fresh data…",
   };
+  const chosen = source === "replay" ? replayReceivers : liveReceivers;
   return (
     <>
       {error && (
@@ -238,9 +341,10 @@ export function Deploy({
           </button>
         </div>
         <p>
-          Predict actions from one CSI receiver. Live capture and recorded
-          replay use the selected model’s preprocessing. Camera images are for
-          visualization only.
+          Every selected receiver is read over one shared CSI window, scored by
+          the trained model and fused into a single pose — the same way training
+          used all receivers. Live capture and recorded replay use the model’s
+          own preprocessing. Camera images are for visualization only.
         </p>
         {!catalog.models.length && (
           <p className="notice">
@@ -293,19 +397,28 @@ export function Deploy({
                   ))}
                 </select>
               </label>
-              <label className="field">
-                <span>Replay receiver</span>
-                <select
-                  aria-label="Replay receiver"
-                  value={replayReceiver}
-                  disabled={running || busy}
-                  onChange={(e) => setReplayReceiver(e.target.value)}
-                >
-                  {replayReceivers.map((name: string) => (
-                    <option key={name}>{name}</option>
-                  ))}
-                </select>
-              </label>
+              <fieldset className="field">
+                <span>Replay receivers to fuse</span>
+                {sessionReceivers.map((name: string) => (
+                  <label className="checkbox" key={name}>
+                    <input
+                      type="checkbox"
+                      aria-label={`Replay receiver ${name}`}
+                      checked={replayReceivers.includes(name)}
+                      disabled={running || busy}
+                      onChange={(e) =>
+                        setReplayReceivers((old) =>
+                          toggle(old, name, e.target.checked),
+                        )
+                      }
+                    />
+                    <span>{name}</span>
+                  </label>
+                ))}
+                {!sessionReceivers.length && (
+                  <span className="subtle">No receivers in this recording</span>
+                )}
+              </fieldset>
               <label className="field">
                 <span>Replay speed</span>
                 <select
@@ -324,23 +437,31 @@ export function Deploy({
             </>
           ) : (
             <>
-              <label className="field">
-                <span>Live receiver</span>
-                <select
-                  aria-label="Live receiver"
-                  value={receiver}
-                  disabled={running || busy}
-                  onChange={(e) => setReceiver(e.target.value)}
-                >
-                  <option value="">Choose a connected receiver</option>
-                  {receivers.map((b) => (
-                    <option key={b.identity} value={b.identity}>
+              <fieldset className="field">
+                <span>Live receivers to fuse</span>
+                {receivers.map((b) => (
+                  <label className="checkbox" key={b.identity}>
+                    <input
+                      type="checkbox"
+                      aria-label={`Live receiver ${b.logical_name}`}
+                      checked={liveReceivers.includes(b.identity)}
+                      disabled={running || busy}
+                      onChange={(e) =>
+                        setLiveReceivers((old) =>
+                          toggle(old, b.identity, e.target.checked),
+                        )
+                      }
+                    />
+                    <span>
                       {b.logical_name} ·{" "}
                       {ports.find((p) => p.identity === b.identity)?.port}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                    </span>
+                  </label>
+                ))}
+                {!receivers.length && (
+                  <span className="subtle">No connected CSI receivers</span>
+                )}
+              </fieldset>
               <label className="field">
                 <span>Serial baud rate</span>
                 <input
@@ -378,15 +499,17 @@ export function Deploy({
           <p className="subtle">
             {selectedModel.preprocessing.window_seconds}s window ·{" "}
             {selectedModel.preprocessing.sample_rate_hz} Hz · 52 subcarriers ·
-            Classes: {selectedModel.classes.join(", ")}
+            Classes: {selectedModel.classes.join(", ")} · Fusing{" "}
+            {chosen.length} receiver{chosen.length === 1 ? "" : "s"}
           </p>
         )}
         {source === "replay" && (
           <p className="subtle">
-            Replay preserves recorded CSI timing. Using the model’s own training
-            session is a demonstration, not a measure of accuracy on new
-            recordings. Recorded video follows the same capture timestamps and
-            replay speed as CSI.
+            Replay preserves recorded CSI timing, and every selected receiver is
+            replayed on the recording’s own clock so their windows stay aligned.
+            Using the model’s own training session is a demonstration, not a
+            measure of accuracy on new recordings. Recorded video follows the
+            same capture timestamps and replay speed as CSI.
           </p>
         )}
         {cameraDevice && (
@@ -403,9 +526,7 @@ export function Deploy({
               running ||
               !!serviceError ||
               !selectedModel ||
-              (source === "replay"
-                ? !replayReceiver
-                : !receivers.some((b) => b.identity === receiver))
+              !chosen.length
             }
             onClick={() => void start()}
           >
@@ -433,7 +554,7 @@ export function Deploy({
               ? "Final replay prediction"
               : "Current inferred pose"}
           </h2>
-          <span className="subtle">CSI model output</span>
+          <span className="subtle">Fused CSI model output</span>
         </div>
         {state.error && (
           <div className="alert" role="alert">
@@ -445,13 +566,23 @@ export function Deploy({
             <div className="deploy-prediction">
               <strong>{prediction.label}</strong>
               <span>
-                {(prediction.confidence * 100).toFixed(1)}% model score
+                {(prediction.confidence * 100).toFixed(1)}% fused model score
               </span>
             </div>
             <p className="subtle">
-              Window ends at {prediction.source_elapsed_s.toFixed(1)}s ·
-              Inference {prediction.inference_ms.toFixed(1)} ms
+              Window ends at {prediction.source_elapsed_s.toFixed(1)}s · Fused{" "}
+              {prediction.fused_receivers.length} of{" "}
+              {(state.receiver_names || prediction.fused_receivers).length}{" "}
+              receivers ({prediction.fused_receivers.join(", ")}) · Inference{" "}
+              {prediction.inference_ms.toFixed(1)} ms
             </p>
+            {!!prediction.uncovered_receivers?.length && (
+              <p className="notice warning">
+                Not enough CSI coverage in this window for:{" "}
+                {prediction.uncovered_receivers.join(", ")}. The pose is fused
+                from the remaining receivers.
+              </p>
+            )}
             <div className="deploy-scores">
               {Object.entries(prediction.scores).map(([label, score]) => (
                 <label key={label}>
@@ -461,6 +592,29 @@ export function Deploy({
                 </label>
               ))}
             </div>
+            {prediction.receivers?.length > 1 && (
+              <details>
+                <summary>Per-receiver scores before fusion</summary>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Receiver</th>
+                      <th>Action</th>
+                      <th>Model score</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {prediction.receivers.map((r: Json) => (
+                      <tr key={r.receiver}>
+                        <td>{r.receiver}</td>
+                        <td>{r.label}</td>
+                        <td>{(r.confidence * 100).toFixed(1)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </details>
+            )}
           </>
         ) : (
           <p>
@@ -479,10 +633,27 @@ export function Deploy({
           )}{" "}
           · Transport dropped: {state.transport_dropped || 0}
         </p>
+        {!!state.receiver_stats?.length && (
+          <p className="subtle">
+            {state.receiver_stats
+              .map(
+                (r: Json) =>
+                  `${r.receiver}: ${r.accepted} accepted${r.live ? "" : " · no fresh data"}`,
+              )
+              .join(" · ")}
+          </p>
+        )}
         {Object.keys(state.rejected || {}).length > 0 && (
           <p className="subtle">
             {Object.entries(state.rejected)
               .map(([key, count]) => `${key.replaceAll("_", " ")}: ${count}`)
+              .join(" · ")}
+          </p>
+        )}
+        {Object.keys(state.receiver_errors || {}).length > 0 && (
+          <p className="notice warning">
+            {Object.entries(state.receiver_errors)
+              .map(([name, message]) => `${name}: ${message}`)
               .join(" · ")}
           </p>
         )}
@@ -496,48 +667,58 @@ export function Deploy({
               </p>
             )}
             {state.video_available && (
-              <video
-                key={state.id || state.options.replay_session_id}
-                ref={video}
-                aria-label="Synchronized replay video"
-                muted
-                playsInline
-                preload="auto"
-                src={`/api/sessions/${encodeURIComponent(state.options.replay_session_id)}/files/raw/video.mp4`}
-                onPlaying={() => setVideoError("")}
-                onError={() =>
-                  setVideoError(
-                    "Recorded video is unavailable or cannot be decoded",
-                  )
-                }
-              />
+              <>
+                <video
+                  key={state.id || state.options.replay_session_id}
+                  ref={video}
+                  aria-label="Synchronized replay video"
+                  muted
+                  playsInline
+                  preload="auto"
+                  src={`/api/sessions/${encodeURIComponent(state.options.replay_session_id)}/files/raw/video.mp4`}
+                  onPlaying={() => setVideoError("")}
+                  onError={() =>
+                    setVideoError(
+                      "Recorded video is unavailable or cannot be decoded",
+                    )
+                  }
+                />
+                <p className="subtle" role="status">
+                  Video offset from the CSI playhead:{" "}
+                  {(drift.current * 1000).toFixed(0)} ms
+                </p>
+              </>
             )}
           </>
         )}
-        {state.options?.source === "live" &&
-          state.options?.camera &&
-          state.capture_id && (
-            <>
-              <h3>Live camera · aligned with CSI capture time</h3>
-              {state.camera_error && (
-                <p className="notice warning">
-                  Camera: {state.camera_error}. CSI inference continues.
-                </p>
+        {liveCamera && (
+          <>
+            <h3>Live camera · aligned with the fused CSI clock</h3>
+            {state.camera_error && (
+              <p className="notice warning">
+                Camera: {state.camera_error}. CSI inference continues.
+              </p>
+            )}
+            {!preview && (
+              <p className="subtle">
+                Waiting for a camera frame captured at the current CSI time…
+              </p>
+            )}
+            <div className="preview">
+              {preview && (
+                <img src={preview.url} alt="Deployment live camera" />
               )}
-              {!previewReady && (
-                <p className="subtle">Waiting for a fresh camera frame…</p>
-              )}
-              <div className="preview">
-                <img
-                  src={`/api/deploy/camera/${state.capture_id}?frame=${tick}${state.source_timestamp_ns ? `&timestamp_ns=${state.source_timestamp_ns}` : ""}`}
-                  alt="Deployment live camera"
-                  onLoad={() => setPreviewReady(true)}
-                  onError={() => setPreviewReady(false)}
-                  style={{ visibility: previewReady ? "visible" : "hidden" }}
-                />
-              </div>
-            </>
-          )}
+            </div>
+            {preview && (
+              <p className="subtle" role="status">
+                Camera frame offset from the fused CSI clock:{" "}
+                {preview.skew === null
+                  ? "unknown"
+                  : `${preview.skew.toFixed(0)} ms`}
+              </p>
+            )}
+          </>
+        )}
         {!!state.history?.length && (
           <details>
             <summary>Recent predictions</summary>
@@ -546,7 +727,8 @@ export function Deploy({
                 <tr>
                   <th>Source time</th>
                   <th>Action</th>
-                  <th>Model score</th>
+                  <th>Fused score</th>
+                  <th>Receivers</th>
                 </tr>
               </thead>
               <tbody>
@@ -555,6 +737,7 @@ export function Deploy({
                     <td>{p.source_elapsed_s.toFixed(1)}s</td>
                     <td>{p.label}</td>
                     <td>{(p.confidence * 100).toFixed(1)}%</td>
+                    <td>{p.fused_receivers?.length ?? 1}</td>
                   </tr>
                 ))}
               </tbody>

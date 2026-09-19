@@ -190,10 +190,13 @@ def test_deploy_proxy_uses_registered_receiver_and_current_port(tmp_path, monkey
         request = dict(
             model_session_id="trained",
             source="live",
-            receiver=dict(
-                identity="board", logical_name="stale_name", port="/dev/ttyACM0"
-            ),
+            receivers=[
+                dict(identity="board", logical_name="stale_name", port="/dev/ttyACM0"),
+                dict(identity="other", logical_name="right", port="/dev/ttyACM0"),
+            ],
         )
+        assert client.post("/api/deploy/start", json=request).status_code == 422
+        request["receivers"] = request["receivers"][:1]
         assert client.post("/api/deploy/start", json=request).status_code == 400
         main.registry.put(
             "devices",
@@ -201,8 +204,14 @@ def test_deploy_proxy_uses_registered_receiver_and_current_port(tmp_path, monkey
             dict(identity="board", role="csi_receiver", logical_name="left"),
         )
         assert client.post("/api/deploy/start", json=request).status_code == 200
-        assert forwarded[-1][2]["json"]["receiver"]["port"] == "/dev/ttyACM1"
-        assert forwarded[-1][2]["json"]["receiver"]["logical_name"] == "left"
+        receivers = forwarded[-1][2]["json"]["receivers"]
+        assert receivers[0]["port"] == "/dev/ttyACM1"
+        assert receivers[0]["logical_name"] == "left"
+        # A second, unregistered receiver is refused rather than silently dropped.
+        request["receivers"] = request["receivers"] + [
+            dict(identity="other", logical_name="right", port="/dev/ttyACM2")
+        ]
+        assert client.post("/api/deploy/start", json=request).status_code == 400
         assert client.get("/api/deploy/catalog").status_code == 200
         assert client.get("/api/deploy/status").status_code == 200
         assert client.post("/api/deploy/stop", json={}).status_code == 200

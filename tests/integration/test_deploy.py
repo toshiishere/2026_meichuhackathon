@@ -9,6 +9,7 @@ import time
 import numpy as np
 import pytest
 import scipy.io
+import zstandard
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -54,14 +55,9 @@ class FakePredictor:
     def __init__(self, *args):
         pass
 
-    def predict(self, amp):
-        assert amp.shape == (200, 52)
-        return dict(
-            label="Walking",
-            confidence=0.8,
-            scores={"Static": 0.2, "Walking": 0.8},
-            inference_ms=1,
-        )
+    def scores(self, windows):
+        assert all(window.shape == (200, 52) for window in windows)
+        return np.array([[0.2, 0.8]] * len(windows)), 1.0
 
     def close(self):
         pass
@@ -109,7 +105,7 @@ def test_replay_lifecycle_model_pinning_and_session_lock(tmp_path, monkeypatch):
         model_session_id=session.name,
         source="replay",
         replay_session_id=session.name,
-        replay_receiver="rx",
+        replay_receivers=["rx"],
         replay_speed=4,
     )
     catalog = manager.catalog()
@@ -147,7 +143,7 @@ def test_bad_artifacts_and_failed_gpu_release_leases(tmp_path, monkeypatch):
         model_session_id=session.name,
         source="replay",
         replay_session_id=session.name,
-        replay_receiver="rx",
+        replay_receivers=["rx"],
     )
 
     def broken(*args):
@@ -176,16 +172,16 @@ def test_capture_excludes_recording_and_releases_on_disconnect(tmp_path, monkeyp
     jobs = Jobs(tmp_path)
     handle = capture.DeployCapture(jobs)
     options = DeployCaptureRequest(
-        receiver=dict(logical_name="rx", port="synthetic://rx0")
+        receivers=[dict(logical_name="rx", port="synthetic://rx0")]
     )
     result = handle.start(options)
     try:
         with pytest.raises(BusyError):
             jobs.acquire()
-        wait_for(lambda: len(handle.rows) > 2)
+        wait_for(lambda: len(handle.rows["rx"]) > 2)
         batch = handle.batch(result["capture_id"])
-        assert batch["active"] and len(batch["rows"]) > 0
-        assert "host_timestamp_ns" in batch["rows"][0]
+        assert batch["active"] and len(batch["rows"]["rx"]) > 0
+        assert "host_timestamp_ns" in batch["rows"]["rx"][0]
         with pytest.raises(HTTPException):
             handle.batch("wrong-token")
         handle.last_poll = time.monotonic() - 16
@@ -218,7 +214,7 @@ def test_deployment_api_validation_and_status(tmp_path, monkeypatch):
                 model_session_id=session.name,
                 source="replay",
                 replay_session_id=session.name,
-                replay_receiver="rx",
+                replay_receivers=["rx"],
                 replay_speed=4,
             ),
         )
@@ -266,13 +262,15 @@ def test_binary_serial_capture_decodes_and_feeds_the_training_layout(
     monkeypatch.setattr(capture, "SerialSource", BinarySource)
     handle = capture.DeployCapture(Jobs(tmp_path))
     token = handle.start(
-        DeployCaptureRequest(receiver=dict(logical_name="rx", port="synthetic://rx0"))
+        DeployCaptureRequest(
+            receivers=[dict(logical_name="rx", port="synthetic://rx0")]
+        )
     )["capture_id"]
     try:
-        wait_for(lambda: len(handle.rows) > 1)
+        wait_for(lambda: len(handle.rows["rx"]) > 1)
         data = handle.batch(token)
-        assert data["rows"][0]["firmware_layout"] == "binary_v1"
-        amp = packet_amplitude(data["rows"][0])
+        assert data["rows"]["rx"][0]["firmware_layout"] == "binary_v1"
+        amp = packet_amplitude(data["rows"]["rx"][0])
         assert amp.shape == (52,) and np.isfinite(amp).all()
     finally:
         handle.close()
@@ -293,7 +291,7 @@ def test_replay_accepts_another_session_and_cancellation_releases_both(
             model_session_id=source.name,
             source="replay",
             replay_session_id="other",
-            replay_receiver="rx",
+            replay_receivers=["rx"],
         )
     )
     try:
@@ -328,11 +326,11 @@ def test_live_worker_clears_stale_pose_camera_failure_is_independent(
             return httpx.Response(
                 200,
                 json=dict(
-                    rows=rows,
+                    rows={"rx": rows},
                     active=True,
                     error=None,
-                    dropped=0,
-                    malformed=0,
+                    dropped={"rx": 0},
+                    malformed={"rx": 0},
                     camera_error="Camera disconnected",
                 ),
             )
@@ -350,7 +348,7 @@ def test_live_worker_clears_stale_pose_camera_failure_is_independent(
         DeployRequest(
             model_session_id=session.name,
             source="live",
-            receiver=dict(logical_name="rx", port="synthetic://rx0"),
+            receivers=[dict(logical_name="rx", port="synthetic://rx0")],
             camera=dict(device="synthetic://camera"),
         )
     )
@@ -366,3 +364,181 @@ def test_live_worker_clears_stale_pose_camera_failure_is_independent(
     assert requests[-1].endswith("/stop") and not manager.gpu_guard.locked()
     with session_lock(tmp_path, session.name):
         pass
+
+
+def multi_receiver_session(
+    root, names=("left", "mid", "right"), truncate=None, shift=None
+):
+    """One recording seen by several receivers, as a three-link room would be.
+
+    `shift` offsets a receiver's packet clock, because real links never stamp
+    their packets at exactly the same instants.
+    """
+    session = model_fixture(root)
+    source = session / "raw/csi_rx.csv.zst"
+    text = zstandard.ZstdDecompressor().decompress(source.read_bytes()).decode()
+    header, *lines = text.splitlines(keepends=True)
+    for name in names:
+        rows = lines if name not in (truncate or {}) else lines[: truncate[name]]
+        offset = (shift or {}).get(name)
+        if offset:
+            rows = [
+                f"{int(row.split(',', 1)[0]) + offset},{row.split(',', 1)[1]}"
+                for row in rows
+            ]
+        (session / f"raw/csi_{name}.csv.zst").write_bytes(
+            zstandard.ZstdCompressor().compress("".join([header] + rows).encode())
+        )
+    source.unlink()
+    return session
+
+
+class RecordingPredictor:
+    """Distinct per-receiver scores, so fusion is visible in the result."""
+
+    rows = np.array([[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]])
+
+    def __init__(self, *args):
+        self.batches = []
+
+    def scores(self, windows):
+        self.batches.append([w.copy() for w in windows])
+        return self.rows[: len(windows)], 2.0
+
+    def close(self):
+        pass
+
+
+def test_replay_fuses_every_receiver_over_one_aligned_window(tmp_path, monkeypatch):
+    session = multi_receiver_session(tmp_path)
+    predictors = []
+
+    def build(*args):
+        predictors.append(RecordingPredictor())
+        return predictors[-1]
+
+    monkeypatch.setattr(deploy, "Predictor", build)
+    manager = deploy.Deployment(tmp_path, threading.Lock(), main.session_path)
+    assert manager.catalog()["sources"][0]["receivers"] == ["left", "mid", "right"]
+    manager.start(
+        DeployRequest(
+            model_session_id=session.name,
+            source="replay",
+            replay_session_id=session.name,
+            replay_receivers=["left", "mid", "right"],
+            replay_speed=4,
+        )
+    )
+    try:
+        wait_for(lambda: manager.snapshot()["status"] == "completed", timeout=15)
+    finally:
+        manager.close()
+    state = manager.snapshot()
+    prediction = state["prediction"]
+    # Mean of [0.9,0.1], [0.2,0.8] and [0.1,0.9] is [0.4,0.6]: one fused pose.
+    assert prediction["fused_receivers"] == ["left", "mid", "right"]
+    assert prediction["label"] == "Walking"
+    assert prediction["confidence"] == pytest.approx(0.6)
+    assert prediction["scores"] == pytest.approx({"Static": 0.4, "Walking": 0.6})
+    assert [r["label"] for r in prediction["receivers"]] == [
+        "Static",
+        "Walking",
+        "Walking",
+    ]
+    assert state["accepted"] == 3 * 801
+    assert [s["receiver"] for s in state["receiver_stats"]] == [
+        "left",
+        "mid",
+        "right",
+    ]
+    batches = predictors[0].batches[1:]  # The first batch is the GPU warm-up.
+    assert batches and all(len(batch) == 3 for batch in batches)
+    for batch in batches:
+        # One shared window end per prediction keeps the links time-aligned.
+        assert all(np.array_equal(batch[0], other) for other in batch[1:])
+
+
+def test_a_silent_receiver_leaves_the_fusion_without_stalling_the_clock(
+    tmp_path, monkeypatch
+):
+    session = multi_receiver_session(tmp_path, truncate={"mid": 401})
+    monkeypatch.setattr(deploy, "Predictor", RecordingPredictor)
+    manager = deploy.Deployment(tmp_path, threading.Lock(), main.session_path)
+    manager.start(
+        DeployRequest(
+            model_session_id=session.name,
+            source="replay",
+            replay_session_id=session.name,
+            replay_receivers=["left", "mid", "right"],
+            replay_speed=4,
+        )
+    )
+    try:
+        wait_for(lambda: manager.snapshot()["status"] == "completed", timeout=15)
+    finally:
+        manager.close()
+    state = manager.snapshot()
+    fused = [p["fused_receivers"] for p in state["history"]]
+    assert ["left", "mid", "right"] in fused
+    # After "mid" runs out the remaining links keep predicting to the end.
+    assert fused[-1] == ["left", "right"]
+    assert state["source_elapsed_s"] == pytest.approx(8, abs=0.2)
+    assert (
+        next(s for s in state["receiver_stats"] if s["receiver"] == "mid")["accepted"]
+        == 401
+    )
+
+
+def test_live_capture_reads_every_receiver_into_its_own_queue(tmp_path):
+    from apps.hardware_service.app import deploy as capture
+    from apps.hardware_service.app.jobs import Jobs
+
+    handle = capture.DeployCapture(Jobs(tmp_path))
+    result = handle.start(
+        DeployCaptureRequest(
+            receivers=[
+                dict(logical_name="left", port="synthetic://rx0"),
+                dict(logical_name="right", port="synthetic://rx1"),
+            ]
+        )
+    )
+    try:
+        assert result["receivers"] == ["left", "right"]
+        wait_for(lambda: all(len(q) > 2 for q in handle.rows.values()))
+        batch = handle.batch(result["capture_id"])
+        assert set(batch["rows"]) == {"left", "right"}
+        assert batch["dropped"] == {"left": 0, "right": 0}
+        for name, rows in batch["rows"].items():
+            assert all(row["receiver"] == name for row in rows)
+            assert all("host_timestamp_ns" in row for row in rows)
+    finally:
+        handle.close()
+
+
+def test_offset_receiver_clocks_share_one_window_end(tmp_path, monkeypatch):
+    session = multi_receiver_session(
+        tmp_path, names=("left", "late"), shift={"late": 37_000_000}
+    )
+    monkeypatch.setattr(deploy, "Predictor", RecordingPredictor)
+    manager = deploy.Deployment(tmp_path, threading.Lock(), main.session_path)
+    manager.start(
+        DeployRequest(
+            model_session_id=session.name,
+            source="replay",
+            replay_session_id=session.name,
+            replay_receivers=["left", "late"],
+            replay_speed=4,
+        )
+    )
+    try:
+        wait_for(lambda: manager.snapshot()["status"] == "completed", timeout=15)
+    finally:
+        manager.close()
+    state = manager.snapshot()
+    prediction = state["prediction"]
+    last = {s["receiver"]: s["last_timestamp_ns"] for s in state["receiver_stats"]}
+    assert last == {"left": 18_000_000_000, "late": 18_037_000_000}
+    # The window ends where both links have data, never past one of them.
+    assert prediction["window_end_ns"] == min(last.values())
+    assert prediction["window_end_ns"] - prediction["window_start_ns"] == 2_000_000_000
+    assert prediction["fused_receivers"] == ["left", "late"]

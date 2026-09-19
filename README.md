@@ -165,37 +165,49 @@ does not install dependencies into a host venv.
 1. Open **Deploy** and choose a **Model session** with a completed fine-tune.
    The worker loads the immutable checkpoint and matching class mapping referenced
    by `train/model.json`, verifies the checkpoint hash, and runs the model on ROCm.
-2. Choose **Live serial receiver** and a connected, registered receiver. The
-   existing serial framer reads CRC-checked binary CSI (legacy CSV also works).
-   Keep the ESP32 sender powered; it does not need a USB connection to this computer.
+2. Choose **Live serial receiver** and tick every connected, registered receiver
+   to fuse; all of them are selected by default. Each gets its own reader thread
+   through the existing serial framer, which reads CRC-checked binary CSI (legacy
+   CSV also works). Keep the ESP32 sender powered; it does not need a USB
+   connection to this computer.
 3. Optionally select a **Live camera**. USB camera settings follow Hardware Setup;
    paired phones retain the resolution/FPS of their phone link. The preview is
    independent of model input. A camera failure is reported without stopping CSI
    inference.
-4. Click **Start deployment**. The page shows the predicted action, all class
-   scores, packet diagnostics and recent predictions. These are the model's action
-   classes, not pose keypoint coordinates. Scores are model probabilities, not
-   calibrated accuracy measurements.
+4. Click **Start deployment**. The page shows one fused predicted action, all
+   class scores, the per-receiver scores behind the fusion, packet diagnostics
+   and recent predictions. These are the model's action classes, not pose
+   keypoint coordinates. Scores are model probabilities, not calibrated accuracy
+   measurements.
 5. Click **Stop deployment** to release the receiver, camera, GPU and session
    locks. Leaving the page keeps deployment running; return to Deploy to stop it.
 
 For a demo, choose **Recorded session replay**, then select the same or another
-completed session and one of its recorded receivers. Replay streams the original
+completed session and the recorded receivers to fuse (all of them by default).
+Every selected receiver is replayed on the recording's own clock, so their
+windows stay aligned. Replay streams the original
 `raw/csi_*.csv.zst` or `.csv` at 0.25×–4× speed using recorded host timestamps,
 including gaps, without loading the whole session into memory. It runs the actual
 fine-tuned model, does not substitute video labels, and stops at the end of the
-recording. A live camera, if selected during replay, shows the present scene and
-is not synchronized to the historical recording. Replaying training data is a
-demo, not an independent accuracy evaluation.
+recording. Replaying training data is a demo, not an independent accuracy evaluation.
 
 Training and deployment share the same packet decoder, 52 L-LTF amplitude
 selection, timestamp resampling and per-window global z-score normalization.
 Deployment takes the window duration, sample rate and update stride from the
-trained model's metadata, producing `[1, 1, time_samples, 52]` tensors. It requires
-70% packet coverage, bracketing timestamps and no CSI gaps above 200 ms. It waits
-for a complete window before predicting and clears the current prediction during
-missing data. At present each prediction uses one receiver, matching the trained
-single-link backbone. Camera frames never enter this model.
+trained model's metadata, producing `[receivers, 1, time_samples, 52]` tensors.
+It requires 70% packet coverage, bracketing timestamps and no CSI gaps above
+200 ms. It waits for a complete window before predicting and clears the current
+prediction during missing data.
+
+Every selected receiver is scored over **one shared window end** — the newest
+timestamp all live receivers cover — in a single batched forward pass, and their
+class probabilities are averaged into one pose. This mirrors training, which
+feeds each receiver's window for a labeled interval to the same single-link
+backbone; it is score fusion at deployment, not a retrained multi-link model. A
+receiver silent for more than 500 ms leaves the fusion (and stops holding back
+the shared clock) until it recovers; a receiver without enough coverage for the
+current window is listed as uncovered and the remaining receivers still produce
+a pose. Camera frames never enter this model.
 
 Training and deployment cannot occupy the GPU simultaneously. Live deployment
 owns the hardware lease, preventing recording, flashing and competing previews.

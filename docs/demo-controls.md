@@ -1,27 +1,54 @@
 # Demo playback and recording recovery
 
-## CSI inputs: important limitation
+## CSI inputs: three receivers, one pose
 
-Deployment currently selects **one receiver**, not three concurrent inputs.
-Training reads all recorded receivers, but `preprocess.py` creates independent
-single-link examples (`receiver_mode: shared single-link backbone; each receiver
-is an example`). The current checkpoint is not a fused three-input model.
-This update does not change that model contract or introduce score fusion.
+Deployment reads **every selected receiver** (all of them by default), builds one
+window per receiver ending at the same timestamp, scores them in a single batched
+forward pass and averages the class probabilities into one pose. Training feeds
+each receiver's window for a labeled interval to the same single-link backbone
+(`receiver_mode: shared single-link backbone; each receiver is an example`), so
+this is the deployment counterpart of that: score fusion, not a retrained
+multi-link model, and the existing checkpoints stay valid.
+
+The shared window end is the newest timestamp every live receiver covers, so the
+links are compared at the same moment rather than at whatever each last sent. A
+receiver silent for over 500 ms (scaled by replay speed) drops out of the fusion
+and stops holding the shared clock back; a receiver whose window lacks coverage
+is reported as uncovered. The UI shows the fused pose, which receivers were
+fused, and each receiver's own score before fusion.
 
 ## Deployment video
 
 Recorded-session replay automatically plays `raw/video.mp4`, using
-`raw/video_frames.parquet` to map the CSI replay clock to video PTS. Buffered
-phone recordings use `capture_timestamp_ns`, with legacy recordings falling
-back to `host_timestamp_ns`. Replay speed applies to both CSI and video.
-Leaving and reopening Deploy reconnects playback to the worker's playhead;
-stopping, completion and service disconnection pause playback. Video is muted
-and controlled by deployment, not by an independent video seek bar.
+`raw/video_frames.parquet` to map the CSI replay clock to video PTS. Every
+replayed receiver shares that one clock, so video, CSI and the fused window all
+advance together. Buffered phone recordings use `capture_timestamp_ns`, with
+legacy recordings falling back to `host_timestamp_ns`. Replay speed applies to
+both CSI and video. Leaving and reopening Deploy reconnects playback to the
+worker's playhead; stopping, completion and service disconnection pause
+playback. Video is muted and controlled by deployment, not by an independent
+video seek bar.
 
-For live sources, choose a live camera. The preview selects the buffered camera
-frame nearest the current CSI capture timestamp (maximum difference 500 ms)
-rather than displaying an unrelated latest frame. Camera failure does not stop
-CSI inference. Preview refresh and inference have normal network/window latency;
+A status poll is already a round trip old when it arrives, so the page does not
+simply seek to the value it received. It extrapolates the worker's playhead from
+the sample time (minus half the measured round trip) at the replay speed, then
+absorbs drift up to 350 ms by trimming playback rate by at most 10% and only
+seeks beyond that. The panel reports the current video-to-playhead offset in
+milliseconds. While paused, stopped or completed, the video is placed exactly on
+the reported playhead.
+
+For live sources, choose a live camera. The preview is fetched for the **fused
+CSI clock** — the shared window end across live receivers — and the collector
+returns the buffered frame nearest that time, refusing anything further than
+500 ms away rather than showing an unrelated latest frame. The panel reports the
+served frame's real offset from that CSI time, taken from the collector's
+`X-Host-Timestamp-Ns` header, so the alignment is visible rather than assumed.
+Camera and CSI timestamps come from the same monotonic clock in the collector
+process, including buffered phone frames, which are converted to that clock
+before use. The camera thread now captures at the camera's own frame rate and
+keeps several seconds of frames, so alignment is limited by the camera's frame
+interval, not by a fixed preview throttle. Camera failure does not stop CSI
+inference. Preview refresh and inference have normal network/window latency;
 this is timestamp-aligned visualization, not a hard real-time guarantee.
 
 ## Delete labels / model

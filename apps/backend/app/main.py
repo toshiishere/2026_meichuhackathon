@@ -391,17 +391,24 @@ async def deploy_status():
 @app.post("/api/deploy/start")
 async def deploy_start(body: DeployRequest):
     if body.source == "live":
-        saved = registry.get("devices", body.receiver.identity)
-        if not saved or saved["role"] != "csi_receiver":
-            raise HTTPException(400, "Choose a registered CSI receiver")
         discovered = (await hardware("GET", "/serial")).json()
-        port = next(
-            (p for p in discovered if p["identity"] == body.receiver.identity), None
-        )
-        if not port:
-            raise HTTPException(409, "Receiver disconnected; refresh hardware")
-        body.receiver.port = port["port"]
-        body.receiver.logical_name = saved["logical_name"]
+        for receiver in body.receivers:
+            saved = registry.get("devices", receiver.identity)
+            if not saved or saved["role"] != "csi_receiver":
+                raise HTTPException(400, "Choose registered CSI receivers")
+            port = next(
+                (p for p in discovered if p["identity"] == receiver.identity), None
+            )
+            if not port:
+                raise HTTPException(
+                    409,
+                    f"Receiver {saved['logical_name']} disconnected; refresh hardware",
+                )
+            receiver.port = port["port"]
+            receiver.logical_name = saved["logical_name"]
+        names = [r.logical_name for r in body.receivers]
+        if len(set(names)) != len(names):
+            raise HTTPException(409, "Selected receivers share a logical name")
     return await training_request("POST", "/deploy/start", json=body.model_dump())
 
 

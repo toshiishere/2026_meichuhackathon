@@ -122,16 +122,25 @@ until completion. It pins the immutable run's checkpoint/classes and verifies th
 checkpoint hash before loading the complete fine-tuned state, including its head.
 
 For live input the worker requests an exclusive capture lease from the hardware
-service. That service uses the existing binary/CSV serial framer, stamps packets
-on receipt, and exposes bounded batches over the internal API. Camera acquisition
-runs separately under the same lease and exposes only its latest JPEG. A 15-second
-poll timeout releases hardware if the worker disappears. No model code runs on
-serial acquisition threads and no serial device is exposed to the ROCm container.
+service. That service uses the existing binary/CSV serial framer, reads each
+selected receiver on its own thread into its own bounded queue, stamps packets on
+receipt, and exposes per-receiver batches over the internal API. One receiver
+failing is reported per receiver; the lease ends only when every receiver has
+stopped. Camera acquisition runs separately under the same lease, at the camera's
+own frame rate, keeping a few seconds of timestamped JPEGs so a frame can be
+served for a requested CSI time. A 15-second poll timeout releases hardware if
+the worker disappears. No model code runs on serial acquisition threads and no
+serial device is exposed to the ROCm container.
 
 Inference uses shared training packet validation and timestamp resampling, then
-the training loader's normalization. A bounded rolling window feeds the ResNet18;
-unsupported layouts and inadequate coverage do not produce predictions. Recorded
-replay streams collector CSV/zstd rows on their original host timeline at the
-selected speed, through the same rolling-window path. Labels/video are not used
-as inference inputs. The UI polls deployment status and camera images separately;
-a lost UI connection hides its current prediction but does not stop deployment.
+the training loader's normalization. Each receiver has its own bounded rolling
+window; every live receiver is resampled onto the same window end, scored by the
+ResNet18 in one batch, and the per-receiver class probabilities are averaged into
+a single pose (score fusion of the shared single-link backbone that training used
+on every receiver's windows). Unsupported layouts and inadequate coverage do not
+produce predictions for that receiver, and the pose is fused from the rest.
+Recorded replay streams collector CSV/zstd rows for every selected receiver on
+one shared original host timeline at the selected speed, through the same
+rolling-window path. Labels/video are not used as inference inputs. The UI polls
+deployment status and camera images separately; a lost UI connection hides its
+current prediction but does not stop deployment.

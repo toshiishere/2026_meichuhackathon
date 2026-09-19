@@ -9,6 +9,9 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
 }) => {
   let state: any = { status: "idle" };
   let began = 0;
+  // The worker's playhead, as the page can never observe it directly: the
+  // browser only ever sees samples that are already a round trip old.
+  const playhead = () => Math.min(9, 3 + ((Date.now() - began) / 1000) * 2);
   const model = {
     session_id: "demo",
     classes: ["Static", "Walking"],
@@ -58,12 +61,15 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
         options: route.request().postDataJSON(),
         video_available: true,
         video_time_s: 3,
+        video_playing: true,
       };
       data = state;
     }
     if (path === "/api/deploy/status") {
-      if (state.status === "running")
-        state.video_time_s = Math.min(9, 3 + ((Date.now() - began) / 1000) * 2);
+      if (state.status === "running") {
+        state.video_time_s = playhead();
+        state.video_playing = state.video_time_s < 9;
+      }
       data = state;
     }
     if (path === "/api/deploy/stop") {
@@ -86,25 +92,30 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
   await expect
     .poll(() => video.evaluate((v: HTMLVideoElement) => v.paused))
     .toBe(false);
-  expect(await video.evaluate((v: HTMLVideoElement) => v.playbackRate)).toBe(2);
+  // Playback runs at the replay speed, trimmed slightly to absorb drift.
+  const rate = await video.evaluate((v: HTMLVideoElement) => v.playbackRate);
+  expect(rate).toBeGreaterThan(1.7);
+  expect(rate).toBeLessThan(2.3);
+  // Track the live playhead, not the last polled sample: the page extrapolates
+  // between polls, so it must stay close to where the worker actually is.
   await expect
     .poll(async () =>
       Math.abs(
         (await video.evaluate((v: HTMLVideoElement) => v.currentTime)) -
-          state.video_time_s,
+          playhead(),
       ),
     )
-    .toBeLessThan(0.6);
+    .toBeLessThan(0.35);
   await page.getByRole("button", { name: "Dashboard", exact: true }).click();
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
   await expect
     .poll(async () =>
       Math.abs(
         (await video.evaluate((v: HTMLVideoElement) => v.currentTime)) -
-          state.video_time_s,
+          playhead(),
       ),
     )
-    .toBeLessThan(0.6);
+    .toBeLessThan(0.35);
   await page
     .getByRole("button", { name: "Stop deployment", exact: true })
     .click();
@@ -118,5 +129,5 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
           state.video_time_s,
       ),
     )
-    .toBeLessThan(0.3);
+    .toBeLessThan(0.1);
 });

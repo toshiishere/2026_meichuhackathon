@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Annotated, Literal
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from .config import DEFAULTS
 
@@ -127,34 +127,49 @@ class TrainRequest(Strict):
         return self
 
 
+def unique_receivers(receivers):
+    names = [r.logical_name for r in receivers]
+    ports = [r.port for r in receivers]
+    if len(set(names)) != len(names) or len(set(ports)) != len(ports):
+        raise ValueError("Each deployment receiver needs a unique name and port")
+
+
 class DeployCaptureRequest(Strict):
-    receiver: Receiver | None = None
+    receivers: list[Receiver] = Field(default_factory=list, max_length=8)
     camera: CameraConfig | None = None
     baud_rate: int = Field(default=DEFAULTS["baud_rate"], ge=9600, le=3000000)
 
     @model_validator(mode="after")
     def has_source(self):
-        if not self.receiver and not self.camera:
-            raise ValueError("Select a receiver or a camera")
+        if not self.receivers and not self.camera:
+            raise ValueError("Select at least one receiver or a camera")
+        unique_receivers(self.receivers)
         return self
 
 
 class DeployRequest(Strict):
+    """Every selected receiver feeds the same model; their scores are fused."""
+
     model_session_id: str = Field(pattern=ID)
     source: Literal["live", "replay"]
-    receiver: Receiver | None = None
+    receivers: list[Receiver] = Field(default_factory=list, max_length=8)
     replay_session_id: str | None = Field(default=None, pattern=ID)
-    replay_receiver: str | None = Field(default=None, pattern=ID)
+    replay_receivers: list[Annotated[str, Field(pattern=ID)]] = Field(
+        default_factory=list, max_length=8
+    )
     replay_speed: float = Field(default=1, ge=0.25, le=4)
     camera: CameraConfig | None = None
     baud_rate: int = Field(default=DEFAULTS["baud_rate"], ge=9600, le=3000000)
 
     @model_validator(mode="after")
     def valid_source(self):
-        if self.source == "live" and not self.receiver:
-            raise ValueError("Live deployment needs a receiver")
-        if self.source == "replay" and not (
-            self.replay_session_id and self.replay_receiver
-        ):
-            raise ValueError("Replay needs a session and receiver")
+        if self.source == "live":
+            if not self.receivers:
+                raise ValueError("Live deployment needs at least one receiver")
+            unique_receivers(self.receivers)
+        if self.source == "replay":
+            if not (self.replay_session_id and self.replay_receivers):
+                raise ValueError("Replay needs a session and at least one receiver")
+            if len(set(self.replay_receivers)) != len(self.replay_receivers):
+                raise ValueError("Replay receivers must be distinct")
         return self

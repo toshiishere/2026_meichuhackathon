@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-test("Deploy chooses a model and another replay session, shows predictions, stops and starts live capture", async ({
+test("Deploy fuses the chosen receivers, shows predictions, stops and starts live capture", async ({
   page,
 }) => {
   const starts: any[] = [];
@@ -30,9 +30,18 @@ test("Deploy chooses a model and another replay session, shows predictions, stop
           role: "csi_receiver",
           port: "/dev/ttyACM0",
         },
+        {
+          identity: "rx2",
+          logical_name: "right",
+          role: "csi_receiver",
+          port: "/dev/ttyACM2",
+        },
       ];
     if (path === "/api/hardware/serial")
-      data = [{ identity: "rx1", port: "/dev/ttyACM1" }];
+      data = [
+        { identity: "rx1", port: "/dev/ttyACM1" },
+        { identity: "rx2", port: "/dev/ttyACM2" },
+      ];
     if (path === "/api/hardware/cameras")
       data = [
         {
@@ -48,7 +57,7 @@ test("Deploy chooses a model and another replay session, shows predictions, stop
         models: [model],
         sources: [
           { session_id: "trained", receivers: ["left"] },
-          { session_id: "other", receivers: ["right"] },
+          { session_id: "other", receivers: ["left", "mid", "right"] },
         ],
         errors: [],
       };
@@ -60,13 +69,30 @@ test("Deploy chooses a model and another replay session, shows predictions, stop
         status: "running",
         signal: "ready",
         options,
-        accepted: 201,
+        accepted: 603,
+        receiver_names: ["left", "right"],
         prediction: {
           label: "Walking",
-          confidence: 0.8,
-          scores: { Static: 0.2, Walking: 0.8 },
+          confidence: 0.6,
+          scores: { Static: 0.4, Walking: 0.6 },
           source_elapsed_s: 2,
           inference_ms: 4,
+          fused_receivers: ["left", "right"],
+          uncovered_receivers: [],
+          receivers: [
+            {
+              receiver: "left",
+              label: "Static",
+              confidence: 0.9,
+              scores: { Static: 0.9, Walking: 0.1 },
+            },
+            {
+              receiver: "right",
+              label: "Walking",
+              confidence: 0.9,
+              scores: { Static: 0.1, Walking: 0.9 },
+            },
+          ],
         },
       };
       data = state;
@@ -81,17 +107,23 @@ test("Deploy chooses a model and another replay session, shows predictions, stop
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
   await expect(page.getByLabel("Model session")).toHaveValue("trained");
   await page.getByLabel("Replay session").selectOption("other");
-  await expect(page.getByLabel("Replay receiver")).toHaveValue("right");
+  // Every recorded receiver is fused by default; one can be left out.
+  await expect(page.getByLabel("Replay receiver left")).toBeChecked();
+  await expect(page.getByLabel("Replay receiver mid")).toBeChecked();
+  await page.getByLabel("Replay receiver mid").uncheck();
   await page.getByLabel("Replay speed").selectOption("2");
   await page
     .getByRole("button", { name: "Start deployment", exact: true })
     .click();
   await expect(page.locator(".deploy-prediction strong")).toHaveText("Walking");
+  await expect(page.getByText("Fused 2 of 2 receivers")).toBeVisible();
+  await page.getByText("Per-receiver scores before fusion").click();
+  await expect(page.getByRole("cell", { name: "left" })).toBeVisible();
   expect(starts[0]).toMatchObject({
     model_session_id: "trained",
     source: "replay",
     replay_session_id: "other",
-    replay_receiver: "right",
+    replay_receivers: ["left", "right"],
     replay_speed: 2,
     camera: null,
   });
@@ -100,6 +132,8 @@ test("Deploy chooses a model and another replay session, shows predictions, stop
     .getByRole("button", { name: "Stop deployment", exact: true })
     .click();
   await page.getByLabel("CSI source").selectOption("live");
+  await expect(page.getByLabel("Live receiver left")).toBeChecked();
+  await expect(page.getByLabel("Live receiver right")).toBeChecked();
   await page
     .getByLabel("Live camera (optional)")
     .selectOption("phone://" + "b".repeat(32));
@@ -109,7 +143,10 @@ test("Deploy chooses a model and another replay session, shows predictions, stop
   await expect.poll(() => starts.length).toBe(2);
   expect(starts[1]).toMatchObject({
     source: "live",
-    receiver: { logical_name: "left", identity: "rx1", port: "/dev/ttyACM1" },
+    receivers: [
+      { logical_name: "left", identity: "rx1", port: "/dev/ttyACM1" },
+      { logical_name: "right", identity: "rx2", port: "/dev/ttyACM2" },
+    ],
     camera: { width: 640, height: 480, fps: 15 },
     replay_session_id: null,
   });

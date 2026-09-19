@@ -25,10 +25,20 @@ What's different here vs a plain train-from-scratch run:
   train and val and inflate validation metrics.
 - Class-weighted loss, since a single session's data is realistically going
   to be imbalanced (e.g. far more no_move than fall).
+- Reports INTERVALS per class (total / train / val), not just windows: the
+  interval is the independent unit, so a rare class with 3 val intervals
+  gives a very noisy score no matter how many windows they contain. The
+  final report also prints a confusion matrix (rows = true, cols = predicted).
+- --kfold K replaces the single split with stratified K-fold cross-validation
+  over intervals, so every labeled interval is validated exactly once. Metrics
+  come from the model at the END of training (no best-epoch picking on the
+  validation fold) and are pooled over all folds. No checkpoint is saved in
+  this mode -- it is for measuring, then run without --kfold to get weights.
 
 Usage:
     python finetune.py --data-dir ./built_dataset --checkpoint ../Model\\ Code/pretrained/ResNet18_full.pth \\
         --out ./finetuned --epochs-frozen 10 --epochs-finetune 30
+    python finetune.py ... --kfold 5      # cross-validated estimate, no weights saved
 """
 import argparse
 import json
@@ -41,7 +51,7 @@ import scipy.io as sio
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -55,14 +65,6 @@ def load_mat_amplitude(path):
             x = x.T
         else:
             raise ValueError(f"Unexpected shape {x.shape} in {path}")
-    return normalize_amplitude(x)
-
-
-def normalize_amplitude(x):
-    """Shared per-window normalization for training and streaming inference."""
-    # scipy's MAT loader returns column-major arrays. Match its reduction order
-    # for live windows too, preserving the normalization used by saved models.
-    x = np.asfortranarray(x)
     x = (x - np.mean(x)) / (np.std(x) + 1e-8)
     return x.astype(np.float32)  # (T, 52)
 
@@ -103,6 +105,39 @@ def split_by_interval(manifest, val_fraction, seed):
     return manifest[train_mask], manifest[val_mask]
 
 
+def make_interval_folds(manifest, k, seed):
+    """Stratified K-fold over intervals: each class's intervals are shuffled and
+    dealt round-robin to the k folds, so every interval lands in exactly one
+    validation fold and windows from one interval never straddle train/val.
+    The round-robin start rotates between classes to keep fold sizes even."""
+    rng = np.random.RandomState(seed)
+    intervals = manifest[["interval_id", "label"]].drop_duplicates()
+
+    fold_of, offset = {}, 0
+    for _, group in intervals.groupby("label"):
+        ids = group["interval_id"].tolist()
+        rng.shuffle(ids)
+        for i, iid in enumerate(ids):
+            fold_of[iid] = (offset + i) % k
+        offset += len(ids)
+
+    fold = manifest["interval_id"].map(fold_of)
+    return [(manifest[fold != f], manifest[fold == f]) for f in range(k)]
+
+
+def interval_counts(m):
+    return m.drop_duplicates("interval_id").groupby("label").size().to_dict()
+
+
+def format_confusion(cm, class_names):
+    """Plain-text confusion matrix, rows = true class, columns = predicted."""
+    width = max(len(c) for c in class_names + ["true \\ pred"]) + 2
+    lines = ["".join(f"{h:>{width}}" for h in ["true \\ pred"] + class_names)]
+    for name, row in zip(class_names, cm):
+        lines.append(f"{name:>{width}}" + "".join(f"{int(v):>{width}}" for v in row))
+    return "\n".join(lines)
+
+
 def build_model_with_new_head(checkpoint_path, num_classes, model_code_dir):
     sys.path.insert(0, model_code_dir)
     from ESP_Fi_model import ESP_Fi_ResNet18
@@ -111,7 +146,7 @@ def build_model_with_new_head(checkpoint_path, num_classes, model_code_dir):
     # build the model with a placeholder fc, load everything else, discard
     # the checkpoint's fc, then attach a fresh one for THIS task's classes.
     model = ESP_Fi_ResNet18(num_classes=1)
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
     filtered = {k: v for k, v in state_dict.items() if not k.startswith("fc.")}
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     expected_missing = {"fc.weight", "fc.bias"}
@@ -144,13 +179,23 @@ def evaluate(model, loader, criterion, device, class_names):
             total_loss += loss.item() * x.size(0)
             all_preds.extend(torch.argmax(out, dim=1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
-    acc = float(np.mean(np.array(all_preds) == np.array(all_labels)))
-    f1 = f1_score(all_labels, all_preds, labels=list(range(len(class_names))), average="macro", zero_division=0)
-    # labels= keeps the report valid when a class (e.g. a rare Falling) has no
-    # val samples; without it sklearn raises on the target_names length mismatch
-    report = classification_report(all_labels, all_preds, labels=list(range(len(class_names))),
-                                    target_names=class_names, zero_division=0, digits=3)
-    return acc, f1, total_loss / len(loader.dataset), report
+    return summarize(all_labels, all_preds, class_names, total_loss / len(loader.dataset))
+
+
+def summarize(y_true, y_pred, class_names, loss=float("nan")):
+    labels = list(range(len(class_names)))
+    # labels= keeps the report/matrix valid when a class (e.g. a rare Falling)
+    # has no val samples; without it sklearn raises on the target_names mismatch
+    return {
+        "acc": float(np.mean(np.array(y_pred) == np.array(y_true))),
+        "f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+        "loss": loss,
+        "report": classification_report(y_true, y_pred, labels=labels, target_names=class_names,
+                                        zero_division=0, digits=3),
+        "confusion": confusion_matrix(y_true, y_pred, labels=labels),
+        "y_true": list(y_true),
+        "y_pred": list(y_pred),
+    }
 
 
 def train_phase(model, train_loader, val_loader, criterion, device, epochs, lr,
@@ -180,15 +225,81 @@ def train_phase(model, train_loader, val_loader, criterion, device, epochs, lr,
             total += y.size(0)
 
         train_acc = correct / total
-        val_acc, val_f1, val_loss, _ = evaluate(model, val_loader, criterion, device, class_names)
+        res = evaluate(model, val_loader, criterion, device, class_names)
         print(f"[{phase_name}] epoch {epoch+1}/{epochs}: "
               f"train_acc={train_acc:.3f} train_loss={running_loss/total:.4f}  "
-              f"val_acc={val_acc:.3f} val_f1={val_f1:.3f} val_loss={val_loss:.4f}")
+              f"val_acc={res['acc']:.3f} val_f1={res['f1']:.3f} val_loss={res['loss']:.4f}")
 
-        if val_f1 > best_f1:
-            best_f1 = val_f1
+        # ckpt_path=None (k-fold mode): keep training to the end, no best-epoch pick
+        if ckpt_path is not None and res["f1"] > best_f1:
+            best_f1 = res["f1"]
             torch.save(model.state_dict(), ckpt_path)
     return best_f1
+
+
+def class_weights_for(train_m, class_names):
+    train_counts = train_m["label"].value_counts()
+    weights = torch.tensor(
+        [1.0 / max(train_counts.get(c, 1), 1) for c in class_names], dtype=torch.float32
+    )
+    return weights / weights.sum() * len(class_names)
+
+
+def fit(train_m, val_m, args, class_names, class_to_idx, device, ckpt_path):
+    """Two-phase fine-tune of a fresh copy of the pretrained model. Returns
+    (model, best_val_f1, criterion, val_loader). With ckpt_path=None nothing is
+    saved and the returned model is the one from the last epoch."""
+    def files_for(m):
+        return [os.path.join(args.data_dir, row.label, row.filename) for row in m.itertuples()]
+
+    train_ds = WindowDataset(files_for(train_m), train_m["label"].tolist(), class_to_idx)
+    val_ds = WindowDataset(files_for(val_m), val_m["label"].tolist(), class_to_idx)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+
+    # class-weighted loss -- a single/few sessions' worth of data is realistically imbalanced
+    weights = class_weights_for(train_m, class_names)
+    print(f"Class weights: {dict(zip(class_names, weights.tolist()))}")
+
+    model = build_model_with_new_head(args.checkpoint, len(class_names), args.model_code_dir)
+    model.to(device)
+    criterion = nn.CrossEntropyLoss(weight=weights.to(device))
+    best_f1 = 0.0
+
+    print("\n=== Phase 1: frozen backbone, training new head only ===")
+    set_backbone_trainable(model, trainable=False)
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable params: {n_trainable}")
+    best_f1 = train_phase(model, train_loader, val_loader, criterion, device,
+                           args.epochs_frozen, args.lr_frozen, class_names,
+                           best_f1, ckpt_path, "frozen")
+
+    print("\n=== Phase 2: unfrozen, fine-tuning whole model ===")
+    set_backbone_trainable(model, trainable=True)
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable params: {n_trainable}")
+    best_f1 = train_phase(model, train_loader, val_loader, criterion, device,
+                           args.epochs_finetune, args.lr_finetune, class_names,
+                           best_f1, ckpt_path, "finetune")
+    return model, best_f1, criterion, val_loader
+
+
+def print_interval_summary(manifest, train_m, val_m, class_names):
+    """Intervals are the independent unit: print them per class next to windows,
+    and flag classes whose validation score rests on only a handful of them."""
+    total_iv, train_iv, val_iv = (interval_counts(m) for m in (manifest, train_m, val_m))
+    print("Intervals per class (total -> train / val)   windows (train / val):")
+    for c in class_names:
+        print(f"  {c:<10} {total_iv.get(c, 0):>3} -> {train_iv.get(c, 0):>3} / {val_iv.get(c, 0):>3}"
+              f"     {int((train_m['label'] == c).sum()):>5} / {int((val_m['label'] == c).sum()):>4}")
+        if val_iv.get(c, 0) == 0:
+            print(f"  WARNING: no validation intervals for {c} -- its metrics below are meaningless")
+        elif val_iv.get(c, 0) < 5:
+            print(f"  WARNING: {c} validation metrics rest on only {val_iv[c]} interval(s); "
+                  f"one interval flipping moves recall by {100 / val_iv[c]:.0f}%")
+        if train_iv.get(c, 0) < 5:
+            print(f"  WARNING: only {train_iv.get(c, 0)} training interval(s) for {c} -- "
+                  f"the model will memorize them rather than generalize")
 
 
 def main():
@@ -206,6 +317,9 @@ def main():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--val-fraction", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--kfold", type=int, default=0,
+                    help="K>=2: stratified K-fold cross-validation over intervals instead of one "
+                         "train/val split; reports pooled metrics, saves no checkpoint")
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -228,70 +342,72 @@ def main():
     class_to_idx = {c: i for i, c in enumerate(class_names)}
     print(f"Training classes: {class_names}")
 
+    if args.kfold:
+        run_kfold(manifest, args, class_names, class_to_idx, device)
+        return
+
     train_m, val_m = split_by_interval(manifest, args.val_fraction, args.seed)
     print(f"Intervals: {manifest['interval_id'].nunique()} total -> "
           f"{train_m['interval_id'].nunique()} train, {val_m['interval_id'].nunique()} val")
     print(f"Windows: {len(train_m)} train, {len(val_m)} val")
-
-    for split_name, m in [("train", train_m), ("val", val_m)]:
-        counts = m["label"].value_counts().to_dict()
-        print(f"  {split_name} class counts: {counts}")
-        thin = {c: n for c, n in counts.items() if n < 5}
-        if thin:
-            print(f"  WARNING: very few {split_name} samples for {thin} -- "
-                  f"results for these classes will be unreliable until more data is collected")
-
-    def files_for(m, root):
-        return [os.path.join(root, row.label, row.filename) for row in m.itertuples()]
-
-    train_files = files_for(train_m, args.data_dir)
-    val_files = files_for(val_m, args.data_dir)
-    train_ds = WindowDataset(train_files, train_m["label"].tolist(), class_to_idx)
-    val_ds = WindowDataset(val_files, val_m["label"].tolist(), class_to_idx)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-
-    # class-weighted loss -- a single/few sessions' worth of data is realistically imbalanced
-    train_counts = train_m["label"].value_counts()
-    weights = torch.tensor(
-        [1.0 / max(train_counts.get(c, 1), 1) for c in class_names], dtype=torch.float32
-    )
-    weights = weights / weights.sum() * len(class_names)
-    print(f"Class weights: {dict(zip(class_names, weights.tolist()))}")
-
-    model = build_model_with_new_head(args.checkpoint, len(class_names), args.model_code_dir)
-    model.to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights.to(device))
+    print_interval_summary(manifest, train_m, val_m, class_names)
 
     ckpt_path = os.path.join(args.out, "finetuned_resnet18.pth")
-    best_f1 = 0.0
-
-    print("\n=== Phase 1: frozen backbone, training new head only ===")
-    set_backbone_trainable(model, trainable=False)
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable params: {n_trainable}")
-    best_f1 = train_phase(model, train_loader, val_loader, criterion, device,
-                           args.epochs_frozen, args.lr_frozen, class_names,
-                           best_f1, ckpt_path, "frozen")
-
-    print("\n=== Phase 2: unfrozen, fine-tuning whole model ===")
-    set_backbone_trainable(model, trainable=True)
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable params: {n_trainable}")
-    best_f1 = train_phase(model, train_loader, val_loader, criterion, device,
-                           args.epochs_finetune, args.lr_finetune, class_names,
-                           best_f1, ckpt_path, "finetune")
+    model, best_f1, criterion, val_loader = fit(train_m, val_m, args, class_names, class_to_idx,
+                                                 device, ckpt_path)
 
     print(f"\nBest val macro-F1: {best_f1:.3f}")
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    _, _, _, report = evaluate(model, val_loader, criterion, device, class_names)
+    res = evaluate(model, val_loader, criterion, device, class_names)
     print("\nFinal validation report (best checkpoint):")
-    print(report)
+    print(res["report"])
+    print("Confusion matrix (windows; rows = true, columns = predicted):")
+    print(format_confusion(res["confusion"], class_names))
 
     with open(os.path.join(args.out, "classes.json"), "w") as f:
         json.dump({"class_names": class_names, "class_to_idx": class_to_idx}, f, indent=2)
     print(f"\nSaved checkpoint: {ckpt_path}")
     print(f"Saved class mapping: {os.path.join(args.out, 'classes.json')}")
+
+
+def run_kfold(manifest, args, class_names, class_to_idx, device):
+    k = args.kfold
+    if k < 2:
+        raise SystemExit("--kfold needs K >= 2")
+    total_iv = interval_counts(manifest)
+    too_few = {c: total_iv.get(c, 0) for c in class_names if total_iv.get(c, 0) < 2}
+    if too_few:
+        raise SystemExit(f"K-fold needs >= 2 intervals per class so every fold can train on each "
+                         f"class; too few: {too_few}")
+    thin = {c: total_iv[c] for c in class_names if total_iv[c] < k}
+    if thin:
+        print(f"WARNING: fewer intervals than folds for {thin}; some folds will have no "
+              f"validation samples of those classes")
+
+    pooled_true, pooled_pred, fold_f1 = [], [], []
+    for fold, (train_m, val_m) in enumerate(make_interval_folds(manifest, k, args.seed)):
+        print(f"\n################ Fold {fold + 1}/{k} ################")
+        print(f"Intervals: {train_m['interval_id'].nunique()} train, "
+              f"{val_m['interval_id'].nunique()} val; windows: {len(train_m)} train, {len(val_m)} val")
+        print_interval_summary(manifest, train_m, val_m, class_names)
+        torch.manual_seed(args.seed + fold)
+        model, _, criterion, val_loader = fit(train_m, val_m, args, class_names, class_to_idx,
+                                               device, ckpt_path=None)
+        res = evaluate(model, val_loader, criterion, device, class_names)   # last-epoch model
+        print(f"Fold {fold + 1} (last epoch): acc={res['acc']:.3f} macro-F1={res['f1']:.3f}")
+        pooled_true += res["y_true"]
+        pooled_pred += res["y_pred"]
+        fold_f1.append(res["f1"])
+
+    pooled = summarize(pooled_true, pooled_pred, class_names)
+    print(f"\n################ Pooled over {k} folds (last-epoch models, every interval validated once) "
+          f"################")
+    print(f"Per-fold macro-F1: mean {np.mean(fold_f1):.3f}, std {np.std(fold_f1):.3f}, "
+          f"min {np.min(fold_f1):.3f}, max {np.max(fold_f1):.3f}")
+    print(pooled["report"])
+    print("Confusion matrix (windows; rows = true, columns = predicted):")
+    print(format_confusion(pooled["confusion"], class_names))
+    print("\nNo checkpoint saved in --kfold mode; run without --kfold to train the deployable model.")
 
 
 if __name__ == "__main__":
