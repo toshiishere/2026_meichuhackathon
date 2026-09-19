@@ -402,6 +402,14 @@ header {
 .panel-heading h2 {
   margin: 0;
 }
+.panel-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.panel-heading-actions .checkbox {
+  margin-bottom: 0;
+}
 .subtle {
   font-size: 11px;
   color: #89978e;

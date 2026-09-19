@@ -5,13 +5,12 @@ import importlib.metadata
 import fcntl
 import json
 import os
-from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
-import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -309,6 +308,10 @@ def remove_artifact(sid: str, artifact: str):
                     "pretrained_resnet18.pth",
                     "classes.json",
                     "metrics.json",
+                    "finetuned_resnet18.onnx",
+                    "finetuned_resnet18.int8.onnx",
+                    "finetuned_resnet18.int8.json",
+                    "finetuned_resnet18.npu.lock",
                 )
             )
             # Remove published copies AND historical outputs, preserving raw data,
@@ -331,9 +334,23 @@ def remove_artifact(sid: str, artifact: str):
                             )
                         if candidate.is_file():
                             files.append(candidate)
+            directories = []
+            if artifact == "model":
+                for folder in folders:
+                    candidate = folder / "finetuned_resnet18.vaip"
+                    if candidate.is_symlink():
+                        raise HTTPException(400, "NPU cache cannot be a symlink")
+                    if candidate.is_dir():
+                        directories.append(candidate)
             for candidate in files:
                 candidate.unlink()
-            return dict(session_id=sid, removed=artifact, files=len(files))
+            for candidate in directories:
+                shutil.rmtree(candidate)
+            return dict(
+                session_id=sid,
+                removed=artifact,
+                files=len(files) + len(directories),
+            )
     except RuntimeError as error:
         raise HTTPException(409, str(error)) from error
     finally:

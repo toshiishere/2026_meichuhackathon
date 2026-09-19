@@ -116,10 +116,17 @@ on worker restart. See README for output paths and deployment commands.
 
 ## Deployment and replay
 
-The ROCm worker also owns a single deployment controller, sharing its GPU mutex
-with training. Deployment holds the selected model and replay-session file locks
+The ROCm worker also owns a single deployment controller, sharing its operation
+mutex with training. It uses ROCm directly or sends normalized windows to the
+isolated Ryzen AI service for XINT8 inference. Deployment holds the selected
+model and replay-session file locks
 until completion. It pins the immutable run's checkpoint/classes and verifies the
 checkpoint hash before loading the complete fine-tuned state, including its head.
+The NPU service runs from the licensed Ryzen AI virtual environment in a separate
+Ubuntu 24.04 container with exclusive `/dev/accel/accel0` access. On first use it
+exports ONNX and calibrates Quark XINT8 from class-balanced training windows. The
+FP32/XINT8 models, provenance and Vitis AI compilation cache live beside the
+immutable run checkpoint and are reused after checksum validation.
 
 For live input the worker requests an exclusive capture lease from the hardware
 service. That service uses the existing binary/CSV serial framer, reads each
@@ -134,9 +141,10 @@ serial device is exposed to the ROCm container.
 
 Inference uses shared training packet validation and timestamp resampling, then
 the training loader's normalization. Each receiver has its own bounded rolling
-window; every live receiver is resampled onto the same window end, scored by the
-ResNet18 in one batch, and the per-receiver class probabilities are averaged into
-a single pose (score fusion of the shared single-link backbone that training used
+window; every live receiver is resampled onto the same window end. ROCm scores
+all receivers in one batch, while the fixed-batch NPU service scores them
+sequentially. Their class probabilities are averaged into a single pose (score
+fusion of the shared single-link backbone that training used
 on every receiver's windows). Unsupported layouts and inadequate coverage do not
 produce predictions for that receiver, and the pose is fused from the rest.
 Recorded replay streams collector CSV/zstd rows for every selected receiver on

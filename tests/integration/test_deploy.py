@@ -1,6 +1,5 @@
 """Deployment preprocessing parity, lifecycle, input validation and resource ownership."""
 
-import csv
 import hashlib
 import json
 import threading
@@ -542,3 +541,60 @@ def test_offset_receiver_clocks_share_one_window_end(tmp_path, monkeypatch):
     assert prediction["window_end_ns"] == min(last.values())
     assert prediction["window_end_ns"] - prediction["window_start_ns"] == 2_000_000_000
     assert prediction["fused_receivers"] == ["left", "late"]
+
+
+def test_npu_predictor_uses_binary_batch_and_releases(monkeypatch):
+    import io
+
+    requests = []
+
+    class Response:
+        is_error = False
+        text = ""
+
+        def __init__(self, value):
+            self.value = value
+
+        def json(self):
+            return self.value
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs["base_url"] == "http://npu-service:8004"
+
+        def post(self, path, **kwargs):
+            requests.append(path)
+            if path == "/models/prepare":
+                assert kwargs["json"] == {"model_session_id": "trained"}
+                return Response(
+                    {
+                        "model_key": "a" * 64,
+                        "classes": ["Static", "Walking"],
+                    }
+                )
+            if path.endswith("/infer"):
+                batch = np.load(io.BytesIO(kwargs["content"]), allow_pickle=False)
+                assert batch.shape == (2, 1, 200, 52)
+                return Response(
+                    {"scores": [[0.25, 0.75], [0.6, 0.4]], "inference_ms": 3.5}
+                )
+            return Response({"released": True})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(deploy.httpx, "Client", Client)
+    predictor = deploy.NpuPredictor(
+        {"session_id": "trained"}, None, ["Static", "Walking"]
+    )
+    scores, elapsed = predictor.scores(
+        [np.ones((200, 52), dtype=np.float32), np.zeros((200, 52), dtype=np.float32)]
+    )
+    np.testing.assert_allclose(scores, [[0.25, 0.75], [0.6, 0.4]])
+    assert elapsed == 3.5
+    predictor.close()
+    assert requests == [
+        "/models/prepare",
+        f"/models/{'a' * 64}/infer",
+        f"/models/{'a' * 64}/release",
+    ]

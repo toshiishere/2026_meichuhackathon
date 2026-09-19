@@ -11,6 +11,7 @@ firmware/**/build
 firmware/**/managed_components
 
 # Keep host environments and temporary training experiments out of build contexts.
+ryzen_ai-1.8.0
 **/.venv
 **/.git
 **/*.swp

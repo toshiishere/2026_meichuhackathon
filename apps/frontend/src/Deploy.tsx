@@ -52,6 +52,7 @@ export function Deploy({
   const [baud, setBaud] = useState(921600);
   const [cameraDevice, setCameraDevice] = useState("");
   const [notify, setNotify] = useState(false);
+  const [useNpu, setUseNpu] = useState(false);
   const [error, setError] = useState("");
   const [serviceError, setServiceError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -132,6 +133,7 @@ export function Deploy({
           setBaud(o.baud_rate);
           setCameraDevice(o.camera?.device || "");
           setNotify(!!value.notify);
+          setUseNpu(!!o.use_npu);
         }
         initialized.current = true;
       } catch (e) {
@@ -298,6 +300,7 @@ export function Deploy({
         baud_rate: baud,
         camera: cameraConfig,
         notify,
+        use_npu: useNpu,
       });
       setState(result);
     } catch (e) {
@@ -352,13 +355,25 @@ export function Deploy({
       <section className="panel">
         <div className="panel-heading">
           <h2>Deploy a session model</h2>
-          <button
-            className="secondary"
-            disabled={busy}
-            onClick={() => void refreshCatalog()}
-          >
-            Refresh models
-          </button>
+          <div className="panel-heading-actions">
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                aria-label="Use NPU"
+                checked={useNpu}
+                disabled={running || busy}
+                onChange={(e) => setUseNpu(e.target.checked)}
+              />
+              <span>Use NPU</span>
+            </label>
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() => void refreshCatalog()}
+            >
+              Refresh models
+            </button>
+          </div>
         </div>
         <p>
           Every selected receiver is read over one shared CSI window, scored by

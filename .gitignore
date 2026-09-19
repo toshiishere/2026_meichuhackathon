@@ -17,3 +17,4 @@ csi_model/Model\ Code/Data/
 csi_model/Model\ Code/inference_kit/sample_data/
 *.mat
 pose_labeling/CTR-GCN/
+ryzen_ai-1.8.0/

@@ -161,6 +161,7 @@ class DeployRequest(Strict):
     camera: CameraConfig | None = None
     baud_rate: int = Field(default=DEFAULTS["baud_rate"], ge=9600, le=3000000)
     notify: bool = False
+    use_npu: bool = False
 
     @model_validator(mode="after")
     def valid_source(self):

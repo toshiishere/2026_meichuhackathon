@@ -165,6 +165,65 @@ class WindowBuffer:
         return resample_window(stamps, amps, end - self.duration, end, self.size)
 
 
+class NpuPredictor:
+    """Thin client for the isolated Ryzen AI runtime service."""
+
+    def __init__(self, metadata, checkpoint, classes):
+        self.normalize = normalize_window
+        self.client = httpx.Client(
+            base_url=os.getenv("NPU_URL", "http://npu-service:8004"), timeout=900
+        )
+        response = self.client.post(
+            "/models/prepare",
+            json={"model_session_id": metadata["session_id"]},
+        )
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            self.client.close()
+            raise RuntimeError(f"NPU model preparation failed: {detail}")
+        prepared = response.json()
+        if prepared.get("classes") != classes:
+            self.client.close()
+            raise ValueError("NPU service returned a different model class mapping")
+        self.key = prepared["model_key"]
+
+    def scores(self, windows):
+        import io
+
+        batch = np.stack([self.normalize(window) for window in windows])[:, None]
+        stream = io.BytesIO()
+        np.save(stream, np.ascontiguousarray(batch), allow_pickle=False)
+        response = self.client.post(
+            f"/models/{self.key}/infer",
+            content=stream.getvalue(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        if response.is_error:
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            raise RuntimeError(f"NPU inference failed: {detail}")
+        result = response.json()
+        probabilities = np.asarray(result["scores"], dtype=np.float32)
+        if (
+            probabilities.shape[0] != len(windows)
+            or not np.isfinite(probabilities).all()
+        ):
+            raise RuntimeError("NPU service returned invalid scores")
+        return probabilities, float(result["inference_ms"])
+
+    def close(self):
+        try:
+            self.client.post(f"/models/{self.key}/release", timeout=10)
+        except httpx.HTTPError:
+            pass
+        self.client.close()
+
+
 class Predictor:
     def __init__(self, metadata, checkpoint, classes):
         import torch
@@ -318,6 +377,7 @@ class Deployment:
                     notify=options.notify,
                     falls=[],
                     notify_error=None,
+                    compute="npu_xint8" if options.use_npu else "rocm_gpu",
                     receiver_names=names,
                     receiver_stats=[],
                     accepted=0,
@@ -430,7 +490,8 @@ class Deployment:
                         video_status="unavailable",
                         video_error=str(error),
                     )
-            predictor = Predictor(metadata, checkpoint, classes)
+            predictor_type = NpuPredictor if options.use_npu else Predictor
+            predictor = predictor_type(metadata, checkpoint, classes)
             if self.stop_event.is_set():
                 return
             prep = metadata["preprocessing"]

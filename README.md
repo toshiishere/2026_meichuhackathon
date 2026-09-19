@@ -7,8 +7,9 @@ and a camera together, and inspect immutable raw sessions.
 Collection remains independent of model processing. The **Train** workspace
 adds session video labeling and CSI fine-tuning in a separate ROCm container.
 **Deploy** uses that worker for live CSI inference and recorded-session replay,
-and `make up` starts the worker with the collection services. `make mock` starts
-collection services without the GPU worker.
+with an isolated Ryzen AI sidecar for optional XINT8 NPU inference. `make up`
+starts both workers with the collection services. `make mock` starts collection
+services without the accelerator workers.
 
 ## Quick start — without hardware
 
@@ -103,6 +104,9 @@ data/sessions/session_XXX/train/
     pretrained_resnet18.pth, finetuned_resnet18.pth, classes.json, metrics.json
     model.json, train_split.csv, validation_split.csv
     dataset/manifest.csv, dataset/preprocessing.json, dataset/<action>/*.mat
+    finetuned_resnet18.onnx             # generated on first NPU deployment
+    finetuned_resnet18.int8.onnx/json   # cached Quark XINT8 model/provenance
+    finetuned_resnet18.vaip/            # cached Vitis AI compilation
 ```
 
 Every run starts from the original baseline. Previous run directories remain
@@ -159,12 +163,17 @@ only when no job is using that session.
 ## Deploy and replay a trained model
 
 Rebuild the stack with `sudo make up` after updating. If using the phone portal,
-run `sudo make phone` afterward. Deployment uses the existing ROCm worker and
-does not install dependencies into a host venv.
+run `sudo make phone` afterward. GPU deployment uses the existing ROCm worker.
+For NPU deployment, put the licensed Ryzen AI 1.8 installation at
+`./ryzen_ai-1.8.0/.venv`, or set `RYZEN_AI_PATH` to its virtual environment. The
+NPU service mounts it read-only and requires `/opt/xilinx/xrt` and
+`/dev/accel/accel0` on the host; the runtime is ignored by Git and is not copied
+into an image.
 
 1. Open **Deploy** and choose a **Model session** with a completed fine-tune.
    The worker loads the immutable checkpoint and matching class mapping referenced
-   by `train/model.json`, verifies the checkpoint hash, and runs the model on ROCm.
+   by `train/model.json` and verifies the checkpoint hash. Leave **Use NPU** off
+   for ROCm, or enable it for Ryzen AI XINT8 inference.
 2. Choose **Live serial receiver** and tick every connected, registered receiver
    to fuse; all of them are selected by default. Each gets its own reader thread
    through the existing serial framer, which reads CRC-checked binary CSI (legacy
@@ -179,8 +188,17 @@ does not install dependencies into a host venv.
    and recent predictions. These are the model's action classes, not pose
    keypoint coordinates. Scores are model probabilities, not calibrated accuracy
    measurements.
-5. Click **Stop deployment** to release the receiver, camera, GPU and session
-   locks. Leaving the page keeps deployment running; return to Deploy to stop it.
+5. Click **Stop deployment** to release the receiver, camera, accelerator and
+   session locks. Leaving the page keeps deployment running; return to Deploy to
+   stop it.
+
+The first NPU start exports the immutable PyTorch checkpoint to fixed-batch ONNX,
+uses up to 128 class-balanced training windows to calibrate Quark XINT8, and lets
+the Vitis AI execution provider compile it. The FP32 ONNX, XINT8 ONNX, conversion
+manifest and provider cache are stored beside that run's `.pth` checkpoint.
+Conversion uses a file lock and atomic publication. Later starts verify and reuse
+these artifacts; each selected receiver is sent through the fixed-batch NPU model
+and the resulting probabilities use the existing score-fusion path.
 
 For a demo, choose **Recorded session replay**, then select the same or another
 completed session and the recorded receivers to fuse (all of them by default).
@@ -204,8 +222,10 @@ It requires 70% packet coverage, bracketing timestamps and no CSI gaps above
 prediction during missing data.
 
 Every selected receiver is scored over **one shared window end** — the newest
-timestamp all live receivers cover — in a single batched forward pass, and their
-class probabilities are averaged into one pose. This mirrors training, which
+timestamp all live receivers cover — and their class probabilities are averaged
+into one pose. ROCm uses one batched forward pass; the fixed-batch NPU model runs
+the aligned receiver windows sequentially inside the NPU service. This mirrors
+training, which
 feeds each receiver's window for a labeled interval to the same single-link
 backbone; it is score fusion at deployment, not a retrained multi-link model. A
 receiver silent for more than 500 ms leaves the fusion (and stops holding back
@@ -223,7 +243,8 @@ a Falling prediction (a stray other action in between does not reset the span),
 measured on the capture or recording's own clock — replay speed does not change it, replays alert too, and the message says
 when it came from a replay. See docs/demo-controls.md.
 
-Training and deployment cannot occupy the GPU simultaneously. Live deployment
+Training and deployment remain mutually exclusive through the worker operation
+lock, including NPU deployment. Live deployment
 owns the hardware lease, preventing recording, flashing and competing previews.
 Model/replay sessions cannot be deleted or retrained while in use. If the worker
 disconnects, the collector stops deployment acquisition after 15 seconds without

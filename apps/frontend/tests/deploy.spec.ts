@@ -106,6 +106,8 @@ test("Deploy fuses the chosen receivers, shows predictions, stops and starts liv
   await page.goto("/");
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
   await expect(page.getByLabel("Model session")).toHaveValue("trained");
+  await expect(page.getByLabel("Use NPU")).not.toBeChecked();
+  await page.getByLabel("Use NPU").check();
   await page.getByLabel("Replay session").selectOption("other");
   // Every recorded receiver is fused by default; one can be left out.
   await expect(page.getByLabel("Replay receiver left")).toBeChecked();
@@ -126,8 +128,11 @@ test("Deploy fuses the chosen receivers, shows predictions, stops and starts liv
     replay_receivers: ["left", "right"],
     replay_speed: 2,
     camera: null,
+    use_npu: true,
   });
   await expect(page.getByLabel("Model session")).toBeDisabled();
+  await expect(page.getByLabel("Use NPU")).toBeChecked();
+  await expect(page.getByLabel("Use NPU")).toBeDisabled();
   await page
     .getByRole("button", { name: "Stop deployment", exact: true })
     .click();

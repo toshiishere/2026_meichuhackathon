@@ -1,4 +1,4 @@
-# ROCm training worker, included by make up. Mock collection stays GPU-free.
+# ROCm training and Ryzen AI NPU workers, included by make up. Mock collection stays accelerator-free.
 services:
   backend:
     environment:
@@ -13,6 +13,7 @@ services:
       DATA_DIR: /data
       HARDWARE_URL: http://hardware-service:8001
       NOTIFIER_URL: http://dc-bot:8003
+      NPU_URL: http://npu-service:8004
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
@@ -24,6 +25,31 @@ services:
       interval: 20s
       timeout: 10s
       start_period: 90s
+      retries: 5
+    stop_grace_period: 30s
+    restart: unless-stopped
+  npu-service:
+    build:
+      context: .
+      dockerfile: docker/npu.Dockerfile
+    environment:
+      DATA_DIR: /data
+      RYZEN_AI_INSTALLATION_PATH: /opt/ryzen-ai
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+      - ${RYZEN_AI_PATH:-./ryzen_ai-1.8.0/.venv}:/opt/ryzen-ai:ro
+      - /opt/xilinx/xrt:/opt/xilinx/xrt:ro
+    healthcheck:
+      test: ['CMD', '/opt/ryzen-ai/bin/python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8004/health")']
+      interval: 20s
+      timeout: 10s
+      start_period: 30s
       retries: 5
     stop_grace_period: 30s
     restart: unless-stopped
