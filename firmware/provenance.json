@@ -35,7 +35,7 @@
   },
   "wifi": {
     "channel": 11,
-    "bandwidth": "HT40",
+    "bandwidth": "HT20",
     "expected_packet_rate_hz": 100
   },
   "receiver_baud_rate": 921600

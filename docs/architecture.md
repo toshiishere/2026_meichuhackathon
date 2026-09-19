@@ -35,7 +35,7 @@ Firmware was inspected before implementation: existing local source has upstream
 commit 8633d67152db2808f141cc1595970aa9cf406045, generated SDK configs identify IDF
 5.5.0, sender target esp32, receiver esp32c3. Sender and receiver app_main.c match
 upstream examples. Vendored project copies retain SDK configs, dependency locks,
-100 Hz, channel 11, HT40 and RX 921600 baud. Original tree and boards are untouched.
+100 Hz, channel 11, HT20 and RX 921600 baud. Original tree and boards are untouched.
 Firmware cache keys include source content, original upstream commit, target,
 IDF version and blink configuration. Builds use private copies of the projects.
 

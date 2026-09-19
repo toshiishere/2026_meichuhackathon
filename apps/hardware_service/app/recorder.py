@@ -35,6 +35,9 @@ FRAME_SCHEMA = pa.schema(
         ("phone_frame_idx", pa.int64()),
         ("phone_capture_timestamp_ms", pa.float64()),
         ("phone_skipped_frames_total", pa.int64()),
+        ("capture_timestamp_ns", pa.int64()),
+        ("phone_estimated_host_capture_ns", pa.int64()),
+        ("phone_clock_uncertainty_ns", pa.int64()),
     ]
 )
 
@@ -43,6 +46,8 @@ class Recorder:
     def __init__(self, config, root, stop=None, preflight_result=None):
         self.config, self.root = config, root
         self.stop = stop or threading.Event()
+        self.camera_stop = threading.Event()
+        self.phone_source = None
         self.gate = threading.Event()
         self.lock = threading.RLock()
         self.errors = []
@@ -229,13 +234,21 @@ class Recorder:
 
     def _camera_reader(self, source, q, done):
         self.gate.wait()
+        resilient = getattr(source, "resilient", False)
+        stop = self.camera_stop if resilient else self.stop
         try:
-            while not self.stop.is_set():
-                value = source.read(self.stop)
+            while not stop.is_set():
+                value = source.read(stop)
+                with self.lock:
+                    self.camera_stats.update(getattr(source, "transport_stats", {}))
                 if value is None:
                     continue
                 frame, stamp = value
-                if self.stop.is_set() or stamp < self.start_ns:
+                if (
+                    (not resilient and self.stop.is_set())
+                    or stamp < self.start_ns
+                    or (self.end_ns is not None and stamp > self.end_ns)
+                ):
                     continue
                 if [frame.shape[1], frame.shape[0]] != [
                     self.config.camera.width,
@@ -252,18 +265,27 @@ class Recorder:
                     s["last_timestamp_ns"] = stamp
                     span = (stamp - s["first_timestamp_ns"]) / 1e9
                     s["actual_fps"] = (s["frames_acquired"] - 1) / span if span else 0
-                try:
-                    q.put_nowait(
-                        (
-                            frame,
-                            stamp,
-                            utc_now(),
-                            dict(getattr(source, "frame_metadata", {})),
-                        )
-                    )
-                except queue.Full:
-                    with self.lock:
-                        self.camera_stats["queue_drops"] += 1
+                value = (
+                    frame,
+                    stamp,
+                    utc_now(),
+                    dict(getattr(source, "frame_metadata", {})),
+                )
+                if resilient:
+                    # An in-progress frame must reach the writer even if final
+                    # draining just set camera_stop. Writer failure aborts this wait.
+                    while not self.errors:
+                        try:
+                            q.put(value, timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+                else:
+                    try:
+                        q.put_nowait(value)
+                    except queue.Full:
+                        with self.lock:
+                            self.camera_stats["queue_drops"] += 1
         finally:
             done.set()
             source.close()
@@ -356,14 +378,17 @@ class Recorder:
                     container.mux(packet)
                 rows.append(
                     dict(
-                        schema_version="1.1",
+                        schema_version="1.2",
                         **frame_metadata,
                         frame_idx=idx,
                         video_pts=pts,
                         video_time_base_num=1,
                         video_time_base_den=1_000_000,
                         video_pts_s=pts / 1e6,
-                        host_timestamp_ns=stamp,
+                        host_timestamp_ns=frame_metadata.get(
+                            "phone_host_receive_ns", stamp
+                        ),
+                        capture_timestamp_ns=stamp,
                         wall_timestamp_utc=wall,
                     )
                 )
@@ -411,8 +436,9 @@ class Recorder:
                     if self.config.camera.device.startswith("phone://")
                     else "camera read completion"
                 ),
-                "phone_capture_clock": "performance.now milliseconds; unaligned with host clock",
-                "video_frames_schema_version": "1.1",
+                "phone_capture_clock": "Legacy phone clocks are unaligned. Resumable phones use a fixed midpoint handshake estimate, with uncertainty recorded separately; raw phone times and host receipt times are retained.",
+                "video_frames_schema_version": "1.2",
+                "video_pts_clock": "capture_timestamp_ns: estimated host capture time for resumable phones, receipt time otherwise; not sensor exposure time",
                 "video_pts_origin": "first encoded frame",
                 "limitations": "USB, serial, camera driver buffering, and phone JPEG encoding/network transport introduce unmeasured latency",
             },
@@ -478,8 +504,24 @@ class Recorder:
             camera = CameraSource(self.config.camera)
             metadata["camera_diagnostics"] = getattr(camera, "diagnostics", {})
             self.sources.append(camera)
+            if getattr(camera, "resilient", False):
+                self.phone_source = camera
+                camera.enable_recording()
+                metadata["clock"][
+                    "phone_clock_offset_ns"
+                ] = camera.phone.clock_offset_ns
+                metadata["clock"][
+                    "phone_clock_uncertainty_ns"
+                ] = camera.phone.clock_uncertainty_ns
             # A successful camera read and open encoder are prerequisites to the start gate.
             warmup = camera.read(self.stop)
+            warmup_deadline = time.monotonic() + 5
+            while (
+                warmup is None
+                and not self.stop.is_set()
+                and time.monotonic() < warmup_deadline
+            ):
+                warmup = camera.read(self.stop)
             if warmup is None:
                 raise RuntimeError("Camera readiness cancelled")
             if [warmup[0].shape[1], warmup[0].shape[0]] != [
@@ -547,7 +589,10 @@ class Recorder:
                     stamps = [
                         (name, s["last_timestamp_ns"]) for name, s in self.stats.items()
                     ]
-                    stamps.append(("camera", self.camera_stats["last_timestamp_ns"]))
+                    if self.phone_source is None:
+                        stamps.append(
+                            ("camera", self.camera_stats["last_timestamp_ns"])
+                        )
                     for name, stamp in stamps:
                         if (now - (stamp or self.start_ns)) / 1e9 > DEFAULTS[
                             "stall_timeout_seconds"
@@ -570,6 +615,27 @@ class Recorder:
             self.stop.set()
             self.end_ns = time.monotonic_ns()
             self.gate.set()
+            if self.phone_source is not None and self.start_ns and not self.errors:
+                deadline = time.monotonic() + DEFAULTS["phone_sync_timeout_seconds"]
+                while (
+                    not self.phone_source.drained_through(self.end_ns)
+                    and not self.errors
+                ):
+                    remaining = deadline - time.monotonic()
+                    with self.lock:
+                        self.camera_stats["phone_sync_wait_seconds"] = max(
+                            0, round(remaining)
+                        )
+                    if remaining <= 0:
+                        self.fail(
+                            "phone",
+                            "Timed out waiting for buffered phone frames. Partial files and phone buffers are retained; keep the phone page open until uploads finish before stopping next time.",
+                        )
+                        break
+                    time.sleep(0.1)
+                with self.lock:
+                    self.camera_stats.pop("phone_sync_wait_seconds", None)
+            self.camera_stop.set()
             for thread in self.producers:
                 thread.join(timeout=10)
                 if thread.is_alive():
@@ -632,6 +698,15 @@ class Recorder:
                 or self.camera_stats["actual_fps"]
                 < self.config.camera.fps * self.config.min_rate_ratio
             )
+            if self.phone_source is not None and self.end_ns and self.start_ns:
+                coverage_fps = self.camera_stats["frames_recorded"] / max(
+                    (self.end_ns - self.start_ns) / 1e9, 0.001
+                )
+                degraded = (
+                    degraded
+                    or coverage_fps
+                    < self.config.camera.fps * self.config.min_rate_ratio
+                )
             metadata.update(
                 status=self.state,
                 quality=(

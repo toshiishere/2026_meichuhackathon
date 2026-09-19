@@ -20,7 +20,7 @@ The recorded upstream hashes remain the original baseline. Blink is unchanged.
 | Sender target | esp32 |
 | Receiver target | esp32c3 |
 | Rate | 100 Hz (`CONFIG_SEND_FREQUENCY`) |
-| Channel / bandwidth | 11 / HT40 |
+| Channel / bandwidth | 11 / HT20 |
 | Sender MAC filter | `1a:00:00:00:00:00` |
 | Receiver serial | 921600 baud |
 | TX sequence | uint32 counter carried in ESP-NOW payload |

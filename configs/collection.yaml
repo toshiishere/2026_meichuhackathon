@@ -11,6 +11,7 @@ serial_queue_size: 4096
 camera_queue_size: 90
 serial_timeout_seconds: 0.2
 stall_timeout_seconds: 5
+phone_sync_timeout_seconds: 600
 max_serial_line_bytes: 32768
 synthetic_loss: 0.01
 synthetic_seed: 42

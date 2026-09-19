@@ -66,7 +66,7 @@ See [firmware provenance](firmware/README.md) and
 The working source was found in `/home/toshi/esp-csi` and copied into this repo;
 no host path dependency remains. The original repository and boards were not
 modified. Receiver output: **921600 baud**. Sender: **100 Hz**, **channel 11**,
-**HT40**, source MAC `1a:00:00:00:00:00`. See [firmware/README.md](firmware/README.md)
+**HT20**, source MAC `1a:00:00:00:00:00`. See [firmware/README.md](firmware/README.md)
 for the preserved commit, SDK configs, targets and hashes.
 
 ### Identify and flash boards
@@ -169,10 +169,39 @@ make phone                # enable phone ports; preserve current hardware mode
 4. On the computer, **Refresh connected cameras**, select the phone in **Capture
    device**, and run preflight/recording as usual. The paired resolution and FPS
    apply automatically. Close a computer preview before preflight or recording.
+   Camera Setup shows the selected phone's paired width, height, and FPS, including
+   when it is automatically selected on page load. These fields are locked because
+   the phone sends frames using its pairing preset. To change them, create a new
+   link with the desired preset, reconnect the phone, refresh cameras, and select
+   the new connection. Editing the preset for a future link does not reconfigure
+   an existing phone stream.
 5. Keep the phone page visible and the phone awake throughout recording. Stop the
-   recording on the computer before stopping the phone camera. A disconnect or
-   upload stall during acquisition makes the session incomplete and preserves
-   collected artifacts. Reconnecting requires a new pairing link.
+   recording on the computer before stopping the phone camera. During a network
+   outage, capture continues into IndexedDB on the phone and the page reconnects
+   automatically with the same camera identity. The saved-frame counter shows the
+   upload backlog. CSI collection continues throughout the outage.
+6. After stopping a session, the collector waits up to **600 seconds** for phone
+   frames captured before the stop time (`phone_sync_timeout_seconds` in
+   `configs/collection.yaml`). Keep the phone page open until the session finishes.
+   **Stop phone camera** finishes capture and uploads its remaining saved frames.
+   If the page reloads, use **Resume … saved frames** on the same phone and browser
+   origin. Reloading itself interrupts capture; already saved frames survive.
+
+Unacknowledged JPEGs are saved before upload and removed only after the collector
+accepts them. Retries are ordered and duplicates are acknowledged without being
+recorded twice. The local buffer is limited to **512 MiB**, or available browser
+storage if lower. Capture pauses with a visible error if storage is full; existing
+saved frames continue uploading. Browser storage eviction/clearing or losing the
+phone cannot be recovered. Keeping the page open and screen awake is still required
+for capture; frames never captured during browser suspension cannot be recreated.
+Only one tab should own each phone stream (enforced through Web Locks where available).
+
+Resume credentials last for 24 hours after the latest connection/heartbeat. They
+are independent of the unused pairing link's 10-minute expiry. The collector must
+remain running: restart loses its in-memory phone registration and ends an active
+session. If final upload times out, the session is incomplete with partial artifacts;
+late uploads cannot be added to that finalized session. Local unacknowledged frames
+are retained, but recovery after a collector restart or timeout is not automatic.
 
 The phone listener exposes only the phone page, certificate, and token-protected
 camera upload. Pair creation, device operations, recording controls, and session
@@ -181,14 +210,21 @@ files remain on the localhost administration listener. Pairing links expire afte
 only `ca.crt` is for download, never the private keys in `PHONE_TLS_PATH`.
 
 Phone frames are JPEG uploads, encoded to the same H.264 session video as USB
-frames. Frames use collector-side WebSocket receipt timestamps in the CSI host
-clock. Phone `performance.now()` timestamps remain separate, **unaligned** values.
-JPEG encoding and network delay remain unmeasured; this provides synchronization
-by arrival time, not phone sensor exposure time. Capture and JPEG encoding run
-independently of acknowledgements, with at most four outstanding frames at 15 FPS
-or eight at 30 FPS. The browser skips fresh frames when encoding or upload capacity
-is full; collector queues remain bounded. Skips and queue drops are counted and can
-mark a recording degraded. Actual FPS must pass preflight.
+frames. Three initial clock probes select the lowest round-trip time; their midpoint
+provides a fixed estimate mapping the phone capture clock to the CSI host clock.
+Video PTS and session boundaries use that estimated capture time, so replaying a
+backlog does not compress an outage into a burst of video. Raw phone capture times,
+actual host receipt times, and the estimated offset/round-trip uncertainty are
+retained separately. The estimate is not hardware synchronization: camera exposure
+latency, scheduling delays, asymmetric networks and clock drift remain unmeasured.
+Legacy phone clients retain receipt-time synchronization.
+
+Capture and JPEG encoding run independently of acknowledgements, with at most four
+outstanding frames at 15 FPS or eight at 30 FPS. A slow connection adds frames to
+local storage instead of skipping capture. Recording queues apply backpressure to
+replay; preview/test queues remain bounded and may drop frames. A busy JPEG encoder
+can still skip capture intervals. Skips, queue drops and insufficient coverage/FPS
+can mark a recording degraded. Actual FPS must pass preflight.
 
 The phone page shows observed camera FPS, acknowledged delivery FPS, JPEG encoding
 time, acknowledgement delay, and frames in flight. High acknowledgement delay
@@ -258,6 +294,18 @@ tracked job and cannot be cancelled after it starts.
 
 ## Data layout
 
+Convert a saved CSI recording or raw binary capture to readable CSV and print
+the first 10 lines (including the header):
+
+```bash
+python3 scripts/convert_csi.py path/to/csi_receiver.csv.zst -o readable.csv
+python3 scripts/convert_csi.py path/to/capture.bin -o readable_binary.csv
+```
+
+The source stays unchanged. `.zst` input uses the `zstd` command or Python's
+`zstandard` package; raw binary input uses the existing CRC-checked decoder.
+See [conversion options](docs/csi-binary-v1.md#convert-an-existing-capture-to-readable-csv).
+
 ```text
 data/
   manifest.parquet                 # rebuildable session index
@@ -272,7 +320,7 @@ data/
       csi_rx_left.csv.zst           # streaming compressed raw CSV
       csi_rx_right.csv.zst
       video.mp4                    # fragmented H.264 MP4
-      video_frames.parquet         # schema 1.1: frame index, PTS, host/UTC, phone times
+      video_frames.parquet         # schema 1.2: frame index, PTS, capture/receipt/phone times
     logs/
       collection.log
       serial_rx_left.jsonl         # boot/gain lines and rejected records
@@ -280,9 +328,15 @@ data/
       <failing-thread>.log         # traceback when an operation fails
 ```
 
-New video frame indexes use schema `1.1`, adding nullable `phone_frame_idx`,
-`phone_capture_timestamp_ms`, and `phone_skipped_frames_total` columns. USB frames
-leave these null. Existing schema `1.0` recordings are readable and unchanged.
+New video frame indexes use schema `1.2`. `host_timestamp_ns` remains the actual
+host receipt time; `capture_timestamp_ns` supplies the video timeline and session
+boundary filtering. For resumable phones it equals `phone_estimated_host_capture_ns`,
+with `phone_clock_uncertainty_ns` recording half the selected handshake round trip.
+`phone_frame_idx`, `phone_capture_timestamp_ms`, and `phone_skipped_frames_total`
+preserve phone provenance. For USB/legacy clients, capture time equals receipt time;
+phone-only fields are null for USB. `wall_timestamp_utc` is the recorder processing time,
+which can be later than capture/receipt when frames are buffered. Existing schema
+`1.0`/`1.1` recordings remain readable and unchanged.
 
 All collection settings are copied into session metadata, including experiment
 notes, optional hardware geometry, receiver firmware provenance when flashed by
