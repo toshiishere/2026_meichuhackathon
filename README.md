@@ -5,8 +5,10 @@ Configure ESP32 boards, verify receiver/camera health, record multiple receivers
 and a camera together, and inspect immutable raw sessions.
 
 Collection remains independent of model processing. The **Train** workspace
-adds session video labeling and CSI fine-tuning in a separate ROCm container,
-started by `make up`. `make mock` starts collection services without the GPU worker.
+adds session video labeling and CSI fine-tuning in a separate ROCm container.
+**Deploy** uses that worker for live CSI inference and recorded-session replay,
+and `make up` starts the worker with the collection services. `make mock` starts
+collection services without the GPU worker.
 
 ## Quick start — without hardware
 
@@ -153,6 +155,53 @@ docker compose -f docker-compose.yml -f docker-compose.train.yml run --rm --no-d
 
 The web worker adds concurrency protection and run history; use the direct CLI
 only when no job is using that session.
+
+## Deploy and replay a trained model
+
+Rebuild the stack with `sudo make up` after updating. If using the phone portal,
+run `sudo make phone` afterward. Deployment uses the existing ROCm worker and
+does not install dependencies into a host venv.
+
+1. Open **Deploy** and choose a **Model session** with a completed fine-tune.
+   The worker loads the immutable checkpoint and matching class mapping referenced
+   by `train/model.json`, verifies the checkpoint hash, and runs the model on ROCm.
+2. Choose **Live serial receiver** and a connected, registered receiver. The
+   existing serial framer reads CRC-checked binary CSI (legacy CSV also works).
+   Keep the ESP32 sender powered; it does not need a USB connection to this computer.
+3. Optionally select a **Live camera**. USB camera settings follow Hardware Setup;
+   paired phones retain the resolution/FPS of their phone link. The preview is
+   independent of model input. A camera failure is reported without stopping CSI
+   inference.
+4. Click **Start deployment**. The page shows the predicted action, all class
+   scores, packet diagnostics and recent predictions. These are the model's action
+   classes, not pose keypoint coordinates. Scores are model probabilities, not
+   calibrated accuracy measurements.
+5. Click **Stop deployment** to release the receiver, camera, GPU and session
+   locks. Leaving the page keeps deployment running; return to Deploy to stop it.
+
+For a demo, choose **Recorded session replay**, then select the same or another
+completed session and one of its recorded receivers. Replay streams the original
+`raw/csi_*.csv.zst` or `.csv` at 0.25×–4× speed using recorded host timestamps,
+including gaps, without loading the whole session into memory. It runs the actual
+fine-tuned model, does not substitute video labels, and stops at the end of the
+recording. A live camera, if selected during replay, shows the present scene and
+is not synchronized to the historical recording. Replaying training data is a
+demo, not an independent accuracy evaluation.
+
+Training and deployment share the same packet decoder, 52 L-LTF amplitude
+selection, timestamp resampling and per-window global z-score normalization.
+Deployment takes the window duration, sample rate and update stride from the
+trained model's metadata, producing `[1, 1, time_samples, 52]` tensors. It requires
+70% packet coverage, bracketing timestamps and no CSI gaps above 200 ms. It waits
+for a complete window before predicting and clears the current prediction during
+missing data. At present each prediction uses one receiver, matching the trained
+single-link backbone. Camera frames never enter this model.
+
+Training and deployment cannot occupy the GPU simultaneously. Live deployment
+owns the hardware lease, preventing recording, flashing and competing previews.
+Model/replay sessions cannot be deleted or retrained while in use. If the worker
+disconnects, the collector stops deployment acquisition after 15 seconds without
+polling. Deployment does not modify raw sessions or save new recordings.
 
 ## Real hardware
 

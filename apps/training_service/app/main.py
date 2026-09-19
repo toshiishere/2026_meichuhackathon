@@ -17,11 +17,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from apps.common.config import DATA
-from apps.common.schemas import ID, TrainRequest
+from apps.common.schemas import ID, TrainRequest, DeployRequest
+from .deploy import Deployment
 from apps.common.session_lock import session_lock
 from apps.common.storage import Registry, atomic_json, utc_now
 
 manager = None
+deployment = None
 
 
 def gpu_info():
@@ -84,7 +86,7 @@ class TrainingJobs:
     def submit(self, sid, options):
         if not self.guard.acquire(blocking=False):
             raise HTTPException(
-                409, "Training GPU is busy; wait or cancel the current job"
+                409, "GPU is busy training or deploying; stop the active job first"
             )
         lease = session_lock(self.root, sid)
         entered = False
@@ -194,9 +196,11 @@ class TrainingJobs:
 
 @asynccontextmanager
 async def lifespan(app):
-    global manager
+    global manager, deployment
     manager = TrainingJobs(DATA)
+    deployment = Deployment(DATA, manager.guard, session_path)
     yield
+    deployment.close()
     manager.close()
 
 
@@ -205,7 +209,37 @@ app = FastAPI(title="Session training worker", lifespan=lifespan)
 
 @app.get("/health")
 def health():
-    return dict(status="ok", gpu=gpu_info(), active_job=manager.current)
+    return dict(
+        status="ok",
+        gpu=gpu_info(),
+        active_job=manager.current,
+        deployment=deployment.snapshot()["status"] if deployment else "idle",
+    )
+
+
+@app.get("/deploy/catalog")
+def deployment_catalog():
+    return deployment.catalog()
+
+
+@app.get("/deploy/status")
+def deployment_status():
+    return deployment.snapshot()
+
+
+@app.post("/deploy/start")
+def deployment_start(options: DeployRequest):
+    try:
+        return deployment.start(options)
+    except (ValueError, KeyError, OSError) as error:
+        raise HTTPException(400, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/deploy/stop")
+def deployment_stop():
+    return deployment.stop()
 
 
 @app.get("/sessions/{sid}")

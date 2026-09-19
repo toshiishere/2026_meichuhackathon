@@ -11,6 +11,7 @@ services:
         ROCM_GPU: ${ROCM_GPU:-gfx1152}
     environment:
       DATA_DIR: /data
+      HARDWARE_URL: http://hardware-service:8001
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri

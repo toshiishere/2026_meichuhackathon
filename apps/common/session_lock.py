@@ -13,7 +13,7 @@ def session_lock(root, session_id):
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError(
-                "Session is busy training or being removed; wait for completion"
+                "Session is busy training, deploying or being removed; wait for completion"
             ) from None
         try:
             yield

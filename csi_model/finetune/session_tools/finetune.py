@@ -55,6 +55,14 @@ def load_mat_amplitude(path):
             x = x.T
         else:
             raise ValueError(f"Unexpected shape {x.shape} in {path}")
+    return normalize_amplitude(x)
+
+
+def normalize_amplitude(x):
+    """Shared per-window normalization for training and streaming inference."""
+    # scipy's MAT loader returns column-major arrays. Match its reduction order
+    # for live windows too, preserving the normalization used by saved models.
+    x = np.asfortranarray(x)
     x = (x - np.mean(x)) / (np.std(x) + 1e-8)
     return x.astype(np.float32)  # (T, 52)
 

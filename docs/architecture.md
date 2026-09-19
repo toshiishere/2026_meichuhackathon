@@ -113,3 +113,25 @@ Complete stage outputs are published separately; immutable run directories and a
 atomic `train/model.json` pointer identify the matching model, classes, labels,
 settings and metrics. Interrupted jobs retain their partial run and become failed
 on worker restart. See README for output paths and deployment commands.
+
+## Deployment and replay
+
+The ROCm worker also owns a single deployment controller, sharing its GPU mutex
+with training. Deployment holds the selected model and replay-session file locks
+until completion. It pins the immutable run's checkpoint/classes and verifies the
+checkpoint hash before loading the complete fine-tuned state, including its head.
+
+For live input the worker requests an exclusive capture lease from the hardware
+service. That service uses the existing binary/CSV serial framer, stamps packets
+on receipt, and exposes bounded batches over the internal API. Camera acquisition
+runs separately under the same lease and exposes only its latest JPEG. A 15-second
+poll timeout releases hardware if the worker disappears. No model code runs on
+serial acquisition threads and no serial device is exposed to the ROCm container.
+
+Inference uses shared training packet validation and timestamp resampling, then
+the training loader's normalization. A bounded rolling window feeds the ResNet18;
+unsupported layouts and inadequate coverage do not produce predictions. Recorded
+replay streams collector CSV/zstd rows on their original host timeline at the
+selected speed, through the same rolling-window path. Labels/video are not used
+as inference inputs. The UI polls deployment status and camera images separately;
+a lost UI connection hides its current prediction but does not stop deployment.

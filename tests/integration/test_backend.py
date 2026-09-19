@@ -170,3 +170,40 @@ def test_training_proxy_validates_session_and_operations(tmp_path, monkeypatch):
             client.post("/api/train/jobs/" + "a" * 32 + "/delete", json={}).status_code
             == 404
         )
+
+
+def test_deploy_proxy_uses_registered_receiver_and_current_port(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DATA", tmp_path)
+    forwarded = []
+
+    async def training(method, path, **kwargs):
+        forwarded.append((method, path, kwargs))
+        return {"status": "starting"}
+
+    async def hardware(method, path, **kwargs):
+        assert path == "/serial"
+        return httpx.Response(200, json=[dict(identity="board", port="/dev/ttyACM1")])
+
+    monkeypatch.setattr(main, "training_request", training)
+    monkeypatch.setattr(main, "hardware", hardware)
+    with TestClient(main.app) as client:
+        request = dict(
+            model_session_id="trained",
+            source="live",
+            receiver=dict(
+                identity="board", logical_name="stale_name", port="/dev/ttyACM0"
+            ),
+        )
+        assert client.post("/api/deploy/start", json=request).status_code == 400
+        main.registry.put(
+            "devices",
+            "board",
+            dict(identity="board", role="csi_receiver", logical_name="left"),
+        )
+        assert client.post("/api/deploy/start", json=request).status_code == 200
+        assert forwarded[-1][2]["json"]["receiver"]["port"] == "/dev/ttyACM1"
+        assert forwarded[-1][2]["json"]["receiver"]["logical_name"] == "left"
+        assert client.get("/api/deploy/catalog").status_code == 200
+        assert client.get("/api/deploy/status").status_code == 200
+        assert client.post("/api/deploy/stop", json={}).status_code == 200
+        assert client.get("/api/deploy/camera/not-a-token").status_code == 404

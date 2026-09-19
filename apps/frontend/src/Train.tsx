@@ -79,6 +79,7 @@ export function Train({ sessions }: { sessions: Json[] }) {
   const latest = state?.jobs?.[0];
   const running =
     !!health?.active_job ||
+    ["starting", "running", "stopping"].includes(health?.deployment) ||
     state?.jobs?.some((j: Json) => ["queued", "running"].includes(j.status));
   const disabled =
     busy ||
@@ -132,6 +133,9 @@ export function Train({ sessions }: { sessions: Json[] }) {
         <div className="alert" role="alert">
           {error}
         </div>
+      )}
+      {["starting", "running", "stopping"].includes(health?.deployment) && (
+        <p className="notice warning">Deployment is active. Stop it in Deploy before starting a training job.</p>
       )}
       <section className="panel">
         <div className="panel-heading">

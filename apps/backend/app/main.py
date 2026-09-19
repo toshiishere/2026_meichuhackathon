@@ -13,6 +13,7 @@ from apps.common.schemas import (
     RemoveSessionRequest,
     RemoveDeviceRequest,
     TrainRequest,
+    DeployRequest,
 )
 from apps.common.storage import Registry, scan_sessions, read_session, rebuild_manifest
 
@@ -361,3 +362,50 @@ async def training_job(jid: str, action: str, request: Request):
     }:
         raise HTTPException(404, "Unknown training job action")
     return await training_request(request.method, f"/jobs/{jid}/{action}")
+
+
+@app.get("/api/deploy/catalog")
+async def deploy_catalog():
+    return await training_request("GET", "/deploy/catalog")
+
+
+@app.get("/api/deploy/status")
+async def deploy_status():
+    return await training_request("GET", "/deploy/status")
+
+
+@app.post("/api/deploy/start")
+async def deploy_start(body: DeployRequest):
+    if body.source == "live":
+        saved = registry.get("devices", body.receiver.identity)
+        if not saved or saved["role"] != "csi_receiver":
+            raise HTTPException(400, "Choose a registered CSI receiver")
+        discovered = (await hardware("GET", "/serial")).json()
+        port = next(
+            (p for p in discovered if p["identity"] == body.receiver.identity), None
+        )
+        if not port:
+            raise HTTPException(409, "Receiver disconnected; refresh hardware")
+        body.receiver.port = port["port"]
+        body.receiver.logical_name = saved["logical_name"]
+    return await training_request("POST", "/deploy/start", json=body.model_dump())
+
+
+@app.post("/api/deploy/stop")
+async def deploy_stop():
+    return await training_request("POST", "/deploy/stop")
+
+
+@app.get("/api/deploy/camera/{capture_id}")
+async def deploy_camera(capture_id: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", capture_id):
+        raise HTTPException(404, "Capture not found")
+    result = await hardware("GET", f"/deploy/capture/{capture_id}/camera")
+    return Response(
+        result.content,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Host-Timestamp-Ns": result.headers.get("X-Host-Timestamp-Ns", ""),
+        },
+    )

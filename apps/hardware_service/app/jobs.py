@@ -26,7 +26,7 @@ class Jobs:
     def acquire(self):
         if not self.lease.acquire(blocking=False):
             raise BusyError(
-                "Hardware is busy. Stop recording or close camera preview; wait for the current hardware job to finish."
+                "Hardware is busy. Stop recording/deployment or close camera preview; wait for the current hardware job to finish."
             )
 
     def submit(self, kind, function):

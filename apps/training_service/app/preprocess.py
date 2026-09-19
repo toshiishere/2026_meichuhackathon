@@ -48,9 +48,31 @@ def load_labels(path, timeline):
     return rows
 
 
-def decode_packets(path):
-    """Read collector CSV directly, including zstd; reject unsupported RF layouts."""
-    times, amplitudes, rejected = [], [], Counter()
+def packet_amplitude(row):
+    """The same RF layout validation and 52 amplitudes for training and deployment."""
+    bw, length = int(row["bandwidth"]), int(row["len"])
+    if (
+        bw not in INDICES
+        or int(row["sig_mode"]) != 1
+        or int(row["stbc"]) != 0
+        or length != {0: 256, 1: 384}[bw]
+    ):
+        raise ValueError("unsupported_layout")
+    if int(row["first_word"]) != 0:
+        raise ValueError("invalid_first_word")
+    values = json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
+    if (
+        not isinstance(values, list)
+        or len(values) != length
+        or any(type(v) is not int or not -32768 <= v <= 32767 for v in values)
+    ):
+        raise ValueError("malformed")
+    a = np.asarray(values, dtype=np.float32).reshape(-1, 2)
+    return np.hypot(a[:, 0], a[:, 1])[INDICES[bw]]
+
+
+def packet_rows(path):
+    """Stream collector rows without decompressing or loading a whole recording."""
     with path.open("rb") as raw:
         stream = (
             zstandard.ZstdDecompressor().stream_reader(raw)
@@ -72,35 +94,47 @@ def decode_packets(path):
                 raise ValueError(
                     f"{path.name}: need a timestamped collector CSV/.csv.zst; standalone wire binary has no host clock"
                 )
-            for row in reader:
-                try:
-                    stamp, bw, length = (
-                        int(row["host_timestamp_ns"]),
-                        int(row["bandwidth"]),
-                        int(row["len"]),
-                    )
-                    if (
-                        bw not in INDICES
-                        or int(row["sig_mode"]) != 1
-                        or int(row["stbc"]) != 0
-                        or length != {0: 256, 1: 384}[bw]
-                    ):
-                        rejected["unsupported_layout"] += 1
-                        continue
-                    if int(row["first_word"]) != 0:
-                        rejected["invalid_first_word"] += 1
-                        continue
-                    values = json.loads(row["data"])
-                    if len(values) != length or any(
-                        type(v) is not int or not -32768 <= v <= 32767 for v in values
-                    ):
-                        raise ValueError("Invalid CSI samples")
-                    a = np.asarray(values, dtype=np.float32).reshape(-1, 2)
-                    amps = np.hypot(a[:, 0], a[:, 1])[INDICES[bw]]
-                    times.append(stamp)
-                    amplitudes.append(amps)
-                except (ValueError, TypeError, KeyError):
-                    rejected["malformed"] += 1
+            yield from reader
+
+
+def resample_window(stamps, amplitudes, lo, hi, size):
+    """Reject gaps/low coverage, then interpolate onto the model's uniform clock."""
+    stamps = np.asarray(stamps, dtype=np.int64)
+    amplitudes = np.asarray(amplitudes, dtype=np.float32)
+    left, right = max(0, np.searchsorted(stamps, lo, side="right") - 1), min(
+        len(stamps), np.searchsorted(stamps, hi) + 1
+    )
+    stamps, amplitudes = stamps[left:right], amplitudes[left:right]
+    if (
+        len(stamps) < max(3, size * 0.7)
+        or stamps[0] > lo
+        or stamps[-1] < hi
+        or np.max(np.diff(stamps)) > 200_000_000
+    ):
+        return None
+    grid = np.linspace(0, hi - lo, size, endpoint=False)
+    return np.stack(
+        [np.interp(grid, stamps - lo, amplitudes[:, c]) for c in range(52)], axis=1
+    ).astype(np.float32)
+
+
+def decode_packets(path):
+    times, amplitudes, rejected = [], [], Counter()
+    for row in packet_rows(path):
+        try:
+            stamp = int(row["host_timestamp_ns"])
+            amp = packet_amplitude(row)
+            times.append(stamp)
+            amplitudes.append(amp)
+        except (ValueError, TypeError, KeyError) as error:
+            reason = str(error)
+            rejected[
+                (
+                    reason
+                    if reason in {"unsupported_layout", "invalid_first_word"}
+                    else "malformed"
+                )
+            ] += 1
     if len(times) < 3:
         raise ValueError(
             f"{path.name}: insufficient supported CSI packets; rejected={dict(rejected)}. Expected non-STBC HT20/HT40 L-LTF with valid first word."
@@ -154,27 +188,10 @@ def build_dataset(
                     skips["camera_gap"] += 1
                     continue
                 lo, hi = timeline.host_ns(start), timeline.host_ns(end)
-                left, right = max(0, np.searchsorted(ts, lo, side="right") - 1), min(
-                    len(ts), np.searchsorted(ts, hi) + 1
-                )
-                stamps = ts[left:right]
-                if (
-                    len(stamps) < max(3, size * 0.7)
-                    or stamps[0] > lo
-                    or stamps[-1] < hi
-                    or np.max(np.diff(stamps)) > 200_000_000
-                ):
+                amp = resample_window(ts, amps, lo, hi, size)
+                if amp is None:
                     skips["csi_coverage"] += 1
                     continue
-                # Subtract the origin before converting nanoseconds to floating point.
-                grid = np.linspace(0, hi - lo, size, endpoint=False)
-                amp = np.stack(
-                    [
-                        np.interp(grid, stamps - lo, amps[left:right, c])
-                        for c in range(52)
-                    ],
-                    axis=1,
-                ).astype(np.float32)
                 folder = out / label
                 folder.mkdir(exist_ok=True)
                 filename = f"{receiver}-{len(manifest):06d}.mat"

@@ -20,6 +20,7 @@ from apps.common.schemas import (
     PhonePairRequest,
     RemoveSessionRequest,
     ID,
+    DeployCaptureRequest,
 )
 from apps.common.storage import scan_sessions, atomic_json, rebuild_manifest
 from .sources import serial_devices, cameras, CameraSource
@@ -28,6 +29,7 @@ from .jobs import Jobs, BusyError
 from .firmware import probe, flash
 from .recorder import Recorder
 from .phone import hub
+from .deploy import DeployCapture
 
 jobs = None
 recorder = None
@@ -37,13 +39,15 @@ collection_stop = None
 preflight_status = None
 preview_token = None
 preview_stop = None
+deploy_capture = None
 
 
 @asynccontextmanager
 async def lifespan(app):
-    global jobs
+    global jobs, deploy_capture
     DATA.mkdir(parents=True, exist_ok=True)
     jobs = Jobs(DATA)
+    deploy_capture = DeployCapture(jobs)
     for metadata in scan_sessions(DATA):
         if metadata["status"] in {"starting", "recording", "stopping"}:
             metadata.update(
@@ -58,6 +62,7 @@ async def lifespan(app):
             )
     rebuild_manifest(DATA)
     yield
+    deploy_capture.close()
     if collection_stop:
         collection_stop.set()
     # Allow the recorder to drain queues before uvicorn exits.
@@ -70,6 +75,34 @@ async def lifespan(app):
 
 
 app = FastAPI(title="CSI Lab hardware service", lifespan=lifespan)
+
+
+@app.post("/deploy/capture")
+def deploy_start(body: DeployCaptureRequest):
+    return deploy_capture.start(body)
+
+
+@app.get("/deploy/capture/{token}/packets")
+def deploy_packets(token: str):
+    return deploy_capture.batch(token)
+
+
+@app.post("/deploy/capture/{token}/stop")
+def deploy_stop(token: str):
+    return deploy_capture.close(token)
+
+
+@app.get("/deploy/capture/{token}/camera")
+def deploy_camera(token: str):
+    jpeg, stamp = deploy_capture.frame(token)
+    return Response(
+        jpeg,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Host-Timestamp-Ns": str(stamp),
+        },
+    )
 
 
 @app.exception_handler(BusyError)

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 import { Train } from "./Train";
+import { Deploy } from "./Deploy";
 import { PhoneCamera, PhoneSetup } from "./PhoneCamera";
 import { RemoveSessionDialog } from "./RemoveSessionDialog";
 import { readApiResponse } from "./api";
@@ -453,6 +454,7 @@ function App() {
             "Data Collection",
             "Sessions",
             "Train",
+            "Deploy",
             "System / Logs",
           ].map((p, i) => (
             <button
@@ -461,7 +463,7 @@ function App() {
               onClick={() => choosePage(p)}
             >
               <span className="nav-icon" aria-hidden="true">
-                {["◫", "⌘", "◉", "▤", "↗", "≡"][i]}
+                {["◫", "⌘", "◉", "▤", "↗", "▶", "≡"][i]}
               </span>
               {p}
               {p === "Data Collection" && recording && (
@@ -505,6 +507,8 @@ function App() {
                         "Inspect recordings and download their original artifacts.",
                       Train:
                         "Label recorded video and fine-tune a session-specific CSI model.",
+                      Deploy:
+                        "Run a trained CSI model on a live receiver or replay a recording.",
                       "System / Logs":
                         "Hardware operations, results, and diagnostic logs.",
                     } as Json
@@ -1434,6 +1438,7 @@ function App() {
           )}
 
           {page === "Train" && <Train sessions={sessions} />}
+          {page === "Deploy" && <Deploy boards={boards} ports={ports} cameras={cameras} camera={camera} />}
           {page === "Sessions" && (
             <>
               <section className="panel">

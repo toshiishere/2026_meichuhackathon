@@ -125,3 +125,36 @@ class TrainRequest(Strict):
         if self.action != "label" and self.epochs_frozen + self.epochs_finetune == 0:
             raise ValueError("Fine-tuning needs at least one epoch")
         return self
+
+
+class DeployCaptureRequest(Strict):
+    receiver: Receiver | None = None
+    camera: CameraConfig | None = None
+    baud_rate: int = Field(default=DEFAULTS["baud_rate"], ge=9600, le=3000000)
+
+    @model_validator(mode="after")
+    def has_source(self):
+        if not self.receiver and not self.camera:
+            raise ValueError("Select a receiver or a camera")
+        return self
+
+
+class DeployRequest(Strict):
+    model_session_id: str = Field(pattern=ID)
+    source: Literal["live", "replay"]
+    receiver: Receiver | None = None
+    replay_session_id: str | None = Field(default=None, pattern=ID)
+    replay_receiver: str | None = Field(default=None, pattern=ID)
+    replay_speed: float = Field(default=1, ge=0.25, le=4)
+    camera: CameraConfig | None = None
+    baud_rate: int = Field(default=DEFAULTS["baud_rate"], ge=9600, le=3000000)
+
+    @model_validator(mode="after")
+    def valid_source(self):
+        if self.source == "live" and not self.receiver:
+            raise ValueError("Live deployment needs a receiver")
+        if self.source == "replay" and not (
+            self.replay_session_id and self.replay_receiver
+        ):
+            raise ValueError("Replay needs a session and receiver")
+        return self

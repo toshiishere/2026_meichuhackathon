@@ -941,3 +941,9 @@ footer {
 .remove-dialog::backdrop {
   background: #10262988;
 }
+
+.deploy-prediction { display: flex; align-items: baseline; gap: 1.5rem; margin: 1rem 0; }
+.deploy-prediction strong { font-size: 2.5rem; }
+.deploy-scores { max-width: 36rem; }
+.deploy-scores label { display: grid; grid-template-columns: 7rem 1fr 4rem; align-items: center; gap: 1rem; margin: .5rem 0; }
+.deploy-scores meter { width: 100%; }
