@@ -37,7 +37,7 @@ Windowing policy:
   configured overlap -- that's fine, it's still fully inside the interval).
 - Interval < window (this matters: some real `fall` events are shorter than
   a 2s window): ONE window is emitted, centered on the interval's midpoint
-  and clipped to the session's time range. It will include a bit of
+  and shifted (not clipped) to stay inside the skip/video-end limits. It will include a bit of
   surrounding context outside the labeled interval -- this mirrors how the
   paper's own `fall` samples look (a brief dynamic burst plus a static
   aftermath inside one 10s trial), not a tight crop of only the label.
@@ -121,27 +121,36 @@ def video_time_to_host_ns(video_frames, t_s):
 EDGE_TOLERANCE_S = 0.1
 
 
-def make_windows(start_s, end_s, window_s, stride_s, min_start_s=0.0):
+def make_windows(start_s, end_s, window_s, stride_s, min_start_s=0.0, max_end_s=None):
     """Returns a list of (win_start_s, win_end_s) covering [start_s, end_s).
 
-    No window starts before min_start_s. A short event's centered window that
-    would reach earlier is shifted right rather than clipped: clipping would
+    No window starts before min_start_s or ends after max_end_s (the video's
+    end). A window that would cross either limit -- typically a short event's
+    centered window -- is shifted inward rather than clipped: clipping would
     shorten it, and resampling to a fixed length then stretches it in time.
     """
     dur = end_s - start_s
     if dur <= window_s + EDGE_TOLERANCE_S:
         mid = (start_s + end_s) / 2.0
-        w_start = max(mid - window_s / 2.0, min_start_s)
-        return [(w_start, w_start + window_s)]
+        windows = [(mid - window_s / 2.0, mid + window_s / 2.0)]
+    else:
+        windows = []
+        t = start_s
+        while t + window_s <= end_s + 1e-9:
+            windows.append((t, t + window_s))
+            t += stride_s
+        if not windows or windows[-1][1] < end_s - EDGE_TOLERANCE_S:
+            windows.append((end_s - window_s, end_s))
 
-    windows = []
-    t = start_s
-    while t + window_s <= end_s + 1e-9:
-        windows.append((t, t + window_s))
-        t += stride_s
-    if not windows or windows[-1][1] < end_s - EDGE_TOLERANCE_S:
-        windows.append((end_s - window_s, end_s))
-    return windows
+    fitted = []
+    for a, b in windows:
+        if max_end_s is not None and b > max_end_s:
+            a, b = max_end_s - window_s, max_end_s
+        if a < min_start_s:
+            a, b = min_start_s, min_start_s + window_s
+        if not fitted or abs(a - fitted[-1][0]) > 1e-9:  # shifting can make neighbours identical
+            fitted.append((a, b))
+    return fitted
 
 
 def resample_window(csi, lltf_idx, ns0, ns1, n_samples):
@@ -215,7 +224,7 @@ def process_session(session, out_dir, window_s, overlap, sample_rate_hz, receive
         label = row["label"]
         interval_id = f"{session_id}-interval{interval_idx:04d}"
         wins = make_windows(row["start_s"], row["end_s"], window_s, stride_s,
-                             min_start_s=skip_s)
+                             min_start_s=skip_s, max_end_s=video_end_s)
 
         for w_start, w_end in wins:
             ns0 = video_time_to_host_ns(video_frames, max(0, w_start))
