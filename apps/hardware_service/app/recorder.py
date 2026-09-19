@@ -346,7 +346,12 @@ class Recorder:
                 str(video_temp),
                 mode="w",
                 format="mp4",
-                options={"movflags": "frag_keyframe+empty_moov+default_base_moof"},
+                # global_sidx adds the segment index a browser needs to report a
+                # duration or seek; it is written on close, so a killed recording
+                # still ends up exactly as resilient as before.
+                options={
+                    "movflags": "frag_keyframe+empty_moov+default_base_moof+global_sidx"
+                },
             )
             stream = container.add_stream("libx264", rate=self.config.camera.fps)
             stream.width, stream.height = (

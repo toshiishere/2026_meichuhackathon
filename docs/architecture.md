@@ -141,6 +141,9 @@ on every receiver's windows). Unsupported layouts and inadequate coverage do not
 produce predictions for that receiver, and the pose is fused from the rest.
 Recorded replay streams collector CSV/zstd rows for every selected receiver on
 one shared original host timeline at the selected speed, through the same
-rolling-window path. Labels/video are not used as inference inputs. The UI polls
+rolling-window path. Before publishing the replay video the worker makes sure it
+is seekable: a fragmented recording without a segment index is stream-copied
+once into the session's `derived/video.mp4` (raw data untouched) and the browser
+is pointed at whichever file carries an index. Labels/video are not used as inference inputs. The UI polls
 deployment status and camera images separately; a lost UI connection hides its
 current prediction but does not stop deployment.

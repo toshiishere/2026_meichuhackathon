@@ -40,6 +40,11 @@ def test_multi_receiver_video_timestamps_and_immutable_raw(
             pts.append(float(frame.pts * frame.time_base))
     assert len(pts) == len(frame_rows)
     assert pts == pytest.approx([r["video_pts_s"] for r in frame_rows], abs=2e-6)
+    # Recordings carry a segment index, so a browser can report a duration and
+    # seek without first reading the whole file.
+    from apps.training_service.app.playback import needs_index
+
+    assert not needs_index(root / "raw/video.mp4")
     raw_hashes = {
         p.name: hashlib.sha256(p.read_bytes()).hexdigest()
         for p in (root / "raw").iterdir()

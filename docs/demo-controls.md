@@ -19,7 +19,27 @@ fused, and each receiver's own score before fusion.
 
 ## Deployment video
 
-Recorded-session replay automatically plays `raw/video.mp4`, using
+### Why a recording needs an index before it can play
+
+The collector writes fragmented MP4 (`frag_keyframe+empty_moov`) so a killed
+recording still holds every finished fragment. A fragmented file carries no
+sample table, so unless it also carries a segment index a browser must read the
+**whole** file before it can report a duration, show a frame or seek: measured
+in Chrome against a 17-minute, 258 MB session, nothing appeared for ~110
+seconds, while an indexed copy of the same recording showed metadata in 18 ms
+and seeked across 10 minutes in 15 ms.
+
+Recordings now carry that index: the collector adds `global_sidx`, written on
+close, which leaves a killed recording exactly as recoverable as before (its
+fragments survive; only the index is missing). Older recordings are indexed on
+demand instead — the first replay deployment stream-copies the video, with no
+re-encode, into `derived/video.mp4` and reuses it afterwards. `raw/` is never
+modified, and the copy is rebuilt if the recording ever changes. Deployment
+status reports which file the page should play (`video_path`), and
+`video_status: preparing` while the copy is being made. If indexing fails,
+replay falls back to the raw recording and says that playback may start slowly.
+
+Recorded-session replay automatically plays that video, using
 `raw/video_frames.parquet` to map the CSI replay clock to video PTS. Every
 replayed receiver shares that one clock, so video, CSI and the fused window all
 advance together. Buffered phone recordings use `capture_timestamp_ns`, with

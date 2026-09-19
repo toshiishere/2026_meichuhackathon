@@ -189,7 +189,11 @@ windows stay aligned. Replay streams the original
 `raw/csi_*.csv.zst` or `.csv` at 0.25×–4× speed using recorded host timestamps,
 including gaps, without loading the whole session into memory. It runs the actual
 fine-tuned model, does not substitute video labels, and stops at the end of the
-recording. Replaying training data is a demo, not an independent accuracy evaluation.
+recording. Replaying training data is a demo, not an independent accuracy evaluation. The
+recorded video is played from an indexed copy when the original is a fragmented
+recording without a segment index, since a browser would otherwise have to read
+the entire file before showing anything; the copy lives in the session's
+`derived/` directory and `raw/` is never modified.
 
 Training and deployment share the same packet decoder, 52 L-LTF amplitude
 selection, timestamp resampling and per-window global z-score normalization.

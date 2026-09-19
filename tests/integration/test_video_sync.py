@@ -62,3 +62,71 @@ def test_camera_runs_at_its_own_rate_and_keeps_history_for_the_fused_window(
         assert served in stamps and jpeg
     finally:
         handle.close()
+
+
+def fragmented_video(path, seconds=3, fps=10, sidx=False):
+    """A recording in the collector's own container format."""
+    import av
+
+    flags = "frag_keyframe+empty_moov+default_base_moof" + (
+        "+global_sidx" if sidx else ""
+    )
+    with av.open(str(path), "w", options={"movflags": flags}) as container:
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.options = {"preset": "ultrafast", "crf": "35", "g": str(fps)}
+        for i in range(seconds * fps):
+            frame = np.full((48, 64, 3), i % 255, dtype=np.uint8)
+            for packet in stream.encode(
+                av.VideoFrame.from_ndarray(frame, format="bgr24")
+            ):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+def test_unindexed_recording_is_indexed_into_derived_leaving_raw_untouched(tmp_path):
+    import hashlib
+    import json
+    from apps.training_service.app import playback
+
+    session = tmp_path / "session"
+    (session / "raw").mkdir(parents=True)
+    source = session / "raw/video.mp4"
+    fragmented_video(source)
+    assert playback.needs_index(source)
+    before = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    assert playback.ensure_playable_video(session) == "derived/video.mp4"
+    indexed = session / "derived/video.mp4"
+    assert indexed.is_file() and not playback.needs_index(indexed)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+
+    import av
+
+    with av.open(str(indexed)) as container:
+        # A front index: duration and frame count without scanning fragments.
+        assert container.streams.video[0].frames > 0
+        assert float(container.duration) > 0
+    record = json.loads((session / "derived/video.json").read_text())
+    assert record["identity"]["bytes"] == source.stat().st_size
+
+    # The copy is reused, and rebuilt when the recording itself changes.
+    built = indexed.stat().st_mtime_ns
+    assert playback.ensure_playable_video(session) == "derived/video.mp4"
+    assert indexed.stat().st_mtime_ns == built
+    fragmented_video(source, seconds=2)
+    assert playback.ensure_playable_video(session) == "derived/video.mp4"
+    assert indexed.stat().st_mtime_ns != built
+
+
+def test_indexed_recordings_play_from_raw_without_a_copy(tmp_path):
+    from apps.training_service.app import playback
+
+    session = tmp_path / "session"
+    (session / "raw").mkdir(parents=True)
+    # What the collector writes now: fragmented, but with a segment index.
+    fragmented_video(session / "raw/video.mp4", sidx=True)
+    assert not playback.needs_index(session / "raw/video.mp4")
+    assert playback.ensure_playable_video(session) == "raw/video.mp4"
+    assert not (session / "derived").exists()

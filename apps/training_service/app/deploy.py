@@ -31,6 +31,7 @@ from .preprocess import (
     packet_rows,
     resample_window,
 )
+from .playback import ensure_playable_video
 from .timeline import Timeline
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -363,11 +364,27 @@ class Deployment:
                     timeline = Timeline(
                         checked_file(session, "raw/video_frames.parquet")
                     )
+                    self.update(video_status="preparing")
+                    path, failure = "raw/video.mp4", None
+                    try:
+                        # An unindexed fragmented recording makes a browser read
+                        # the whole file before it can show or seek anything.
+                        path = ensure_playable_video(session)
+                    except Exception as error:
+                        failure = f"Playback may start slowly: {error}"
                     self.update(
-                        video_available=True, video_time_s=float(timeline.pts[0])
+                        video_available=True,
+                        video_path=path,
+                        video_status="ready",
+                        video_error=failure,
+                        video_time_s=float(timeline.pts[0]),
                     )
                 except (ValueError, OSError, KeyError) as error:
-                    self.update(video_available=False, video_error=str(error))
+                    self.update(
+                        video_available=False,
+                        video_status="unavailable",
+                        video_error=str(error),
+                    )
             predictor = Predictor(metadata, checkpoint, classes)
             if self.stop_event.is_set():
                 return

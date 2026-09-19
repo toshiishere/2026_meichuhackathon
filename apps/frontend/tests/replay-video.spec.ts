@@ -9,6 +9,7 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
 }) => {
   let state: any = { status: "idle" };
   let began = 0;
+  const requested: string[] = [];
   // The worker's playhead, as the page can never observe it directly: the
   // browser only ever sees samples that are already a round trip old.
   const playhead = () => Math.min(9, 3 + ((Date.now() - began) / 1000) * 2);
@@ -20,6 +21,7 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith("/video.mp4")) {
+      requested.push(path);
       const range = /bytes=(\d+)-(\d*)/.exec(
         route.request().headers().range || "",
       );
@@ -60,6 +62,8 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
         status: "running",
         options: route.request().postDataJSON(),
         video_available: true,
+        video_path: "derived/video.mp4",
+        video_status: "ready",
         video_time_s: 3,
         video_playing: true,
       };
@@ -130,4 +134,8 @@ test("replay video follows the server playhead, speed, stop and reconnect", asyn
       ),
     )
     .toBeLessThan(0.1);
+  // The worker decides which file is seekable; the page plays that one.
+  expect(requested[0]).toBe(
+    "/api/sessions/demo/files/derived/video.mp4",
+  );
 });

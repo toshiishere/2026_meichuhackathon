@@ -86,12 +86,18 @@ export function Deploy({
   useEffect(() => {
     void refreshCatalog();
   }, []);
+  const chosenFor = useRef("");
   useEffect(() => {
     if (running) return;
-    // Fusing every recorded receiver is the default: that is what training saw.
+    // A different recording starts with every one of its receivers fused, the
+    // way training used them; within one recording the boxes are the operator's.
+    const fresh = chosenFor.current !== replay;
+    chosenFor.current = replay;
     setReplayReceivers((old) => {
-      const kept = old.filter((name) => sessionReceivers.includes(name));
-      return kept.length ? kept : sessionReceivers;
+      const kept = fresh
+        ? []
+        : old.filter((name) => sessionReceivers.includes(name));
+      return kept.length || !sessionReceivers.length ? kept : sessionReceivers;
     });
   }, [replay, catalog, running]);
   useEffect(() => {
@@ -666,16 +672,21 @@ export function Deploy({
                 continues.
               </p>
             )}
+            {state.video_status === "preparing" && (
+              <p className="subtle">
+                Indexing the recorded video for playback…
+              </p>
+            )}
             {state.video_available && (
               <>
                 <video
-                  key={state.id || state.options.replay_session_id}
+                  key={`${state.id}:${state.video_path}`}
                   ref={video}
                   aria-label="Synchronized replay video"
                   muted
                   playsInline
                   preload="auto"
-                  src={`/api/sessions/${encodeURIComponent(state.options.replay_session_id)}/files/raw/video.mp4`}
+                  src={`/api/sessions/${encodeURIComponent(state.options.replay_session_id)}/files/${state.video_path || "raw/video.mp4"}`}
                   onPlaying={() => setVideoError("")}
                   onError={() =>
                     setVideoError(
