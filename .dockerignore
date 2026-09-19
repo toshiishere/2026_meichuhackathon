@@ -9,3 +9,15 @@ data
 
 firmware/**/build
 firmware/**/managed_components
+
+# Keep host environments and temporary training experiments out of build contexts.
+**/.venv
+**/.git
+**/*.swp
+pose_labeling/test.mp4
+pose_labeling/action_results*.csv
+pose_labeling/CTR-GCN
+csi_model/session*/
+csi_model/finetune/session*/raw/
+csi_model/finetune/built_dataset/
+csi_model/finetune/session_tools/finetuned/

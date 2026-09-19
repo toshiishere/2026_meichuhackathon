@@ -1,5 +1,8 @@
 .env
+# Local collection data, including raw recordings and session training outputs.
 data/
+# Also exclude session directories stored outside the default data root.
+sessions/
 .venv/
 __pycache__/
 .pytest_cache/

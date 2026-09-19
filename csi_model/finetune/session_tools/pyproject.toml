@@ -1,0 +1,49 @@
+[project]
+name = "CSI_HAR_Finetune"
+version = "0.1.0"
+description = "HAR Finetune pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "torch[device-gfx1152]==2.13.0+rocm10.0.0 ; sys_platform == 'linux'",
+    "torchvision[device-gfx1152]==0.28.0+rocm10.0.0 ; sys_platform == 'linux'",
+    "rocm",
+    "rocm-sdk-core",
+    "rocm-sdk-libraries",
+    "rocm-sdk-device-gfx1152",
+    "amd-torch-device-gfx1152",
+    "amd-torch-device-gfx115x",
+    "amd-torchvision-device-gfx1152",
+    "rocm-bootstrap",
+    "triton",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "scikit-learn",
+    "einops",
+]
+
+# torch/torchvision/torchaudio, plus the ROCm SDK packages they pull in
+# transitively, all come from AMD's index. Every other dependency (numpy,
+# opencv-python, ultralytics, ...) stays on PyPI. explicit = true on the
+# index below enforces that split: only packages listed in
+# [tool.uv.sources] are ever looked up there.
+[tool.uv.sources]
+torch = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+torchvision = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+rocm = { index = "amd-rocm"  , marker = "sys_platform == 'linux'"}
+rocm-sdk-core = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+rocm-sdk-libraries = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+rocm-sdk-libraries-gfx1152 = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+rocm-sdk-device-gfx1152 = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+amd-torch-device-gfx115x = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+amd-torch-device-gfx1152 = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+amd-torchvision-device-gfx1152 = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+rocm-bootstrap = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+pytorch-triton-rocm = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+triton = { index = "amd-rocm", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "amd-rocm"
+url = "https://stable.repo.amd.com/rocm/whl-next/"
+explicit = true

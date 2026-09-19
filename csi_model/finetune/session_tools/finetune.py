@@ -103,7 +103,7 @@ def build_model_with_new_head(checkpoint_path, num_classes, model_code_dir):
     # build the model with a placeholder fc, load everything else, discard
     # the checkpoint's fc, then attach a fresh one for THIS task's classes.
     model = ESP_Fi_ResNet18(num_classes=1)
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     filtered = {k: v for k, v in state_dict.items() if not k.startswith("fc.")}
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     expected_missing = {"fc.weight", "fc.bias"}
@@ -137,7 +137,7 @@ def evaluate(model, loader, criterion, device, class_names):
             all_preds.extend(torch.argmax(out, dim=1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
     acc = float(np.mean(np.array(all_preds) == np.array(all_labels)))
-    f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+    f1 = f1_score(all_labels, all_preds, labels=list(range(len(class_names))), average="macro", zero_division=0)
     # labels= keeps the report valid when a class (e.g. a rare Falling) has no
     # val samples; without it sklearn raises on the target_names length mismatch
     report = classification_report(all_labels, all_preds, labels=list(range(len(class_names))),

@@ -1,0 +1,27 @@
+# ROCm training worker, included by make up. Mock collection stays GPU-free.
+services:
+  backend:
+    environment:
+      TRAINING_URL: http://training-service:8002
+  training-service:
+    build:
+      context: .
+      dockerfile: docker/training.Dockerfile
+      args:
+        ROCM_GPU: ${ROCM_GPU:-gfx1152}
+    environment:
+      DATA_DIR: /data
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    shm_size: '2gb'
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8002/health")']
+      interval: 20s
+      timeout: 10s
+      start_period: 90s
+      retries: 5
+    stop_grace_period: 30s
+    restart: unless-stopped

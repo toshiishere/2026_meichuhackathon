@@ -108,3 +108,20 @@ class RemoveSessionRequest(Strict):
 
 class RemoveDeviceRequest(Strict):
     identity: str = Field(min_length=1, max_length=300)
+
+
+class TrainRequest(Strict):
+    action: Literal["label", "finetune", "auto"]
+    epochs_frozen: int = Field(default=5, ge=0, le=200)
+    epochs_finetune: int = Field(default=15, ge=0, le=200)
+    batch_size: int = Field(default=8, ge=1, le=64)
+    window_seconds: float = Field(default=2, ge=0.5, le=10)
+    sample_rate_hz: int = Field(default=100, ge=20, le=200)
+    overlap: float = Field(default=0.5, ge=0, lt=1)
+    seed: int = Field(default=42, ge=0, le=2**32 - 1)
+
+    @model_validator(mode="after")
+    def validate_epochs(self):
+        if self.action != "label" and self.epochs_frozen + self.epochs_finetune == 0:
+            raise ValueError("Fine-tuning needs at least one epoch")
+        return self

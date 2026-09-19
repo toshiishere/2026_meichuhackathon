@@ -7,7 +7,13 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from apps.common.config import DATA
-from apps.common.schemas import Device, ID, RemoveSessionRequest, RemoveDeviceRequest
+from apps.common.schemas import (
+    Device,
+    ID,
+    RemoveSessionRequest,
+    RemoveDeviceRequest,
+    TrainRequest,
+)
 from apps.common.storage import Registry, scan_sessions, read_session, rebuild_manifest
 
 HARDWARE = os.getenv("HARDWARE_URL", "http://hardware-service:8001")
@@ -306,3 +312,52 @@ async def remove_session(sid: str, body: RemoveSessionRequest):
     return (
         await hardware("POST", f"/sessions/{sid}/remove", json=body.model_dump())
     ).json()
+
+
+# Optional worker: its absence must not interrupt recording or hardware events.
+async def training_request(method, path, **kwargs):
+    address = os.getenv("TRAINING_URL", "http://training-service:8002")
+    try:
+        async with httpx.AsyncClient(base_url=address, timeout=15) as training:
+            response = await training.request(method, path, **kwargs)
+    except httpx.RequestError as error:
+        raise HTTPException(
+            503,
+            "Training service unavailable. Run make up to start the ROCm worker, and check make logs if it remains unavailable.",
+        ) from error
+    if response.is_error:
+        try:
+            detail = response.json().get("detail", response.text)
+        except ValueError:
+            detail = response.text
+        raise HTTPException(response.status_code, detail)
+    return response.json()
+
+
+@app.get("/api/train/health")
+async def training_health():
+    return await training_request("GET", "/health")
+
+
+@app.get("/api/train/sessions/{sid}")
+async def training_status(sid: str):
+    validated_session(sid)
+    return await training_request("GET", f"/sessions/{sid}")
+
+
+@app.post("/api/train/sessions/{sid}/start")
+async def start_training(sid: str, body: TrainRequest):
+    validated_session(sid)
+    return await training_request(
+        "POST", f"/sessions/{sid}/start", json=body.model_dump()
+    )
+
+
+@app.api_route("/api/train/jobs/{jid}/{action}", methods=["GET", "POST"])
+async def training_job(jid: str, action: str, request: Request):
+    if not re.fullmatch(r"[a-f0-9]{32}", jid) or (request.method, action) not in {
+        ("GET", "logs"),
+        ("POST", "cancel"),
+    }:
+        raise HTTPException(404, "Unknown training job action")
+    return await training_request(request.method, f"/jobs/{jid}/{action}")
