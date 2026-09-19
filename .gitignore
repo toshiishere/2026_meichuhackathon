@@ -1,5 +1,8 @@
 .env
+# Local collection data, including raw recordings and session training outputs.
 data/
+# Also exclude session directories stored outside the default data root.
+sessions/
 .venv/
 __pycache__/
 .pytest_cache/
@@ -10,3 +13,6 @@ playwright-report/
 test-results/
 firmware/**/build/
 firmware/**/managed_components/
+csi_model/Model\ Code/Data/
+csi_model/Model\ Code/inference_kit/sample_data/
+*.mat

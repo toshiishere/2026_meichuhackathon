@@ -1,16 +1,17 @@
 DOCKER ?= docker
 COMPOSE = $(DOCKER) compose
+REAL = $(COMPOSE) -f docker-compose.yml -f docker-compose.train.yml
 MOCK = $(COMPOSE) -f docker-compose.yml -f docker-compose.mock.yml
 export PROJECT_GIT_COMMIT := $(shell git rev-parse HEAD)
 .PHONY: up mock down logs test test-integration hardware-shell manifest test-ui phone-cert phone phone-off
 up:
-	$(COMPOSE) up -d --build
+	$(REAL) up -d --build
 mock:
 	$(MOCK) up -d --build
 down:
-	$(COMPOSE) down
+	$(REAL) down
 logs:
-	$(COMPOSE) logs -f --tail=100
+	$(REAL) logs -f --tail=100
 test:
 	$(MOCK) build hardware-service
 	$(MOCK) run --rm --no-deps -e DATA_DIR=/tmp/csi-tests hardware-service python -m pytest tests -m 'not hardware'

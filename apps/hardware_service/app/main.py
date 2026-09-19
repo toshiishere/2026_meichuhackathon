@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 import cv2
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, Response
+from apps.common.session_lock import session_lock
 from apps.common.config import DATA, MODE, DEFAULTS
 from apps.common.schemas import (
     CollectionConfig,
@@ -494,4 +495,8 @@ def remove_session(sid: str, body: RemoveSessionRequest):
             rebuild_manifest(DATA)
         return {"session_id": sid, "removed": True}
 
-    return jobs.submit("session-remove", work)
+    def locked_work(log, stop):
+        with session_lock(DATA, sid):
+            return work(log, stop)
+
+    return jobs.submit("session-remove", locked_work)

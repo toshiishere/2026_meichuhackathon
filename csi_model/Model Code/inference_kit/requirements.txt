@@ -1,0 +1,4 @@
+torch>=1.13.0
+numpy>=1.23.5
+scipy>=1.10.1
+einops>=0.6.0

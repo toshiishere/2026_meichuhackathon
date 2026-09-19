@@ -1,0 +1,21 @@
+ESP-Fi HAR Dataset License
+
+The ESP-Fi HAR dataset is released under the
+Creative Commons Attribution 4.0 International (CC BY 4.0) License.
+
+You are free to:
+- Share — copy and redistribute the dataset
+- Adapt — remix, transform, and build upon the dataset
+- Use for academic and commercial purposes
+
+Under the following terms:
+- Attribution — You must give appropriate credit and cite the original paper:
+
+Wen, Z., Ruan, Y., Wang, X., Zhou, J., Gao, H., Li, T.
+"ESP-Fi HAR: A low-power WiFi CSI dataset for Ad-Hoc IoT human activity recognition."
+Ad Hoc Networks, 2026.
+
+This dataset does not contain personally identifiable information.
+
+Full license text:
+https://creativecommons.org/licenses/by/4.0/

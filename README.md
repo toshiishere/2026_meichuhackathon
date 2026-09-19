@@ -4,9 +4,9 @@ A Docker-first web application for **synchronized WiFi CSI and USB or phone came
 Configure ESP32 boards, verify receiver/camera health, record multiple receivers
 and a camera together, and inspect immutable raw sessions.
 
-This implements the collection scope in `prompt` (milestones 1–6). Video labeling,
-HAR, training, inference, and downstream feature/window dataset generation are
-intentionally excluded. There are no dependencies or services for those tasks.
+Collection remains independent of model processing. The **Train** workspace
+adds session video labeling and CSI fine-tuning in a separate ROCm container,
+started by `make up`. `make mock` starts collection services without the GPU worker.
 
 ## Quick start — without hardware
 
@@ -43,6 +43,117 @@ frame number and monotonic time. Sessions explicitly record `hardware_mode`.
 Synthetic mode never reports a physical probe or firmware flash as successful;
 flashing is unavailable there.
 
+## Labeling and fine-tuning
+
+The **Train** workspace operates on a completed session:
+
+1. Select a session and click **Labeling**. `pose_labeling/inference.py` runs
+   YOLOv8-Pose and the supplied four-class CTR-GCN checkpoint on the session's
+   `raw/video.mp4`, using the AMD GPU. The existing motion gate can also emit
+   `Static`. Record one clearly visible person.
+2. Download/review `train/action_results.csv`. `start_time` and `end_time` are
+   **milliseconds on the video's PTS timeline**, not frame count divided by FPS.
+   `start_host_timestamp_ns` and `end_host_timestamp_ns` map these boundaries to
+   the collector capture clock using `raw/video_frames.parquet`. Schema 1.2's
+   `capture_timestamp_ns` handles replayed phone frames; older indexes use
+   `host_timestamp_ns`. Missing poses and camera gaps break the labeling history.
+3. Click **Fine-tune** to preprocess `raw/csi_*.csv.zst` (or `.csv`) and initialize
+   a session copy of `csi_model/Model Code/pretrained/ResNet18_full.pth`. The supplied
+   `ESP_Fi_ResNet18` backbone is retained; its classifier is replaced for the actions
+   present in this session. All supported actions are included, not just three.
+4. **Auto train** performs labeling → preprocessing → fine-tuning in one job.
+   Watch stage/log output or cancel the job. A failed stage stops the sequence.
+
+The default is two-second windows, 100 Hz resampling, 50% overlap, batch size 8,
+five epochs training the new classifier and fifteen epochs fine-tuning the whole
+model. The UI exposes window size, batch size and epoch counts. Each receiver
+supplies single-link examples to the same pretrained model; this is not a new
+multi-input architecture. Preprocessing extracts 52 L-LTF amplitude subcarriers
+and the loader applies the existing per-window global z-score normalization.
+Raw recordings are read directly without decompressing additional files into `raw/`.
+Only the supplied decoder's non-STBC HT20/256-byte and HT40/384-byte layouts with a
+valid first word are accepted. Rejected packets, gaps and short intervals are
+reported in preprocessing metadata. Standalone wire binary without recorded host
+receipt timestamps cannot be aligned safely and is rejected.
+
+At least two actions with usable windows are needed. Windows stay wholly inside
+one labeled interval; intervals shorter than the selected window are omitted.
+Camera gaps over 500 ms, CSI gaps over 200 ms, and windows below 70% packet coverage
+are omitted. All receivers/windows from an interval stay in the same training or
+validation split. If there are no independent validation intervals, the model
+still trains and the UI explicitly reports **no validation score**. These are
+machine-generated labels and same-session validation, not reviewed ground truth or
+an estimate of performance on new people/rooms.
+
+```text
+data/sessions/session_XXX/train/
+  action_results.csv            # latest completed labeling output
+  action_results.json           # labeling/timestamp provenance
+  pretrained_resnet18.pth        # copied baseline for latest successful fine-tune
+  finetuned_resnet18.pth         # latest successful model state_dict
+  classes.json                  # class names and output indices
+  metrics.json                  # epoch losses and available validation metrics
+  model.json                    # authoritative pointer/provenance for model run
+  runs/<job-id>/
+    options.json, job.log, progress.json
+    action_results.csv          # when this run performed labeling
+    labels_used.csv             # exact label snapshot used for training
+    pretrained_resnet18.pth, finetuned_resnet18.pth, classes.json, metrics.json
+    model.json, train_split.csv, validation_split.csv
+    dataset/manifest.csv, dataset/preprocessing.json, dataset/<action>/*.mat
+```
+
+Every run starts from the original baseline. Previous run directories remain
+available on failure/cancellation or reruns. `model.json` identifies the matching
+run-specific checkpoint, class mapping and preprocessing settings; use that pair
+for later inference. Session removal is blocked while its training job holds a
+shared-storage lock. Worker restart marks unfinished jobs failed; it does not
+silently resume an optimizer or overwrite a prior successful run.
+
+### ROCm container and deployment
+
+All training dependencies are installed by `docker/training.Dockerfile`; neither
+host `.venv` is used or copied. It pins AMD's ROCm 10 wheels for **gfx1152**, matching
+this machine's Radeon 860M, and the provided CTR-GCN source revision. Both pose
+labeling and CSI training fail clearly if a ROCm GPU is unavailable; there is no
+CPU fallback. The image includes the C library headers MIOpen needs for runtime
+kernel compilation. See the [AMD installation guidance](https://rocm.docs.amd.com/en/docs-10.0.0/install/rocm.html)
+and [Ultralytics ROCm integration](https://docs.ultralytics.com/integrations/amd).
+
+Build only, without deploying:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.train.yml build training-service
+```
+
+`make up` builds and starts all collection services and the ROCm training worker.
+Use `sudo make up` if Docker requires root. `make down` and `make logs` also include
+the training worker. To deploy with the existing phone portal enabled:
+
+```bash
+make up
+make phone
+```
+
+Omit `make phone` if the phone portal is not in use. `make up` rebuilds the backend,
+frontend and hardware service as well as the worker so the Train API/UI and
+session-removal lock are installed together. The training worker has no public port, no Docker
+socket, and accesses the GPU through `/dev/kfd` and `/dev/dri`. One job uses the GPU
+at a time. Set `ROCM_GPU` in `.env` before building for a different supported GPU;
+the host AMD driver must support it. The source tree must contain the supplied
+`pose_labeling/yolov8n-pose.pt`, `pose_labeling/ctrgcn_custom_4classes_best.pth`, and
+CSI pretrained checkpoint. No models are downloaded by a recording/training job.
+
+For container-only command-line labeling after building:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.train.yml run --rm --no-deps training-service \
+  python pose_labeling/inference.py --session /data/sessions/session_XXX
+```
+
+The web worker adds concurrency protection and run history; use the direct CLI
+only when no job is using that session.
+
 ## Real hardware
 
 Required: an ESP32 sender and one or more ESP32 receivers running the preserved
@@ -54,7 +165,7 @@ Flash it first, then power it on before preflight; all boards must use the same 
 make down
 make up
 # or, without Make:
-docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.train.yml up -d --build
 ```
 
 The normal Compose file uses **`espressif/idf:v5.5`**, matching the ESP-IDF 5.5.0

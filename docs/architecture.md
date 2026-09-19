@@ -1,8 +1,8 @@
 # Collection architecture
 
-Scope: prompt milestones 1–6 only. The present deliverable is synchronized raw
-CSI and camera collection and inspection. No labeling, learning, inference,
-window datasets, or downstream feature processing is implemented.
+The collection service records synchronized raw CSI and camera data. The optional
+training service labels completed videos and fine-tunes the supplied CSI model;
+model processing never runs in acquisition threads.
 
 Browser (React/TypeScript) → nginx → FastAPI backend → internal hardware API.
 Only the hardware service can access devices. Backend stores logical assignments
@@ -48,19 +48,21 @@ message before JPEG decoding, acknowledges each accepted frame, and delivers dec
 frames through bounded per-camera subscriber queues. The regular camera interface
 supports preview, preflight, recording, and disconnect/stall failure handling.
 
-Phone sequence and `performance.now()` capture times are retained as nullable frame
-index schema 1.1 columns. They never replace the shared host clock. Native phone
-resolution is shown in discovery; the browser scales with letterboxing to the paired
-output size. Sensor-to-host latency remains unmeasured; the phone displays local
-encoding duration and send-to-acknowledgement delay for diagnosis. Client skips and queue drops are
-reported. No clock-offset correction or synthetic frame interpolation is applied.
+Phone frame index schema 1.2 preserves the raw phone clock, actual host receipt,
+and estimated host capture times separately. Resumable clients calibrate a fixed
+midpoint clock offset before capture and retain it across reconnects. Camera
+exposure latency, asymmetric transport delay and clock drift remain limitations.
+The video timeline and training alignment use capture time, so replay does not
+compress a network outage into a burst of video.
 
 Phone capture is paced by new video frames, independently of acknowledgements.
-One JPEG encode and at most four unacknowledged frames at 15 FPS (eight at 30 FPS)
-bound the browser work. Frames are skipped if encoding or transmission capacity is
-full. A five-second acknowledgement/encoding watchdog stops stalled uploads.
-OffscreenCanvas JPEG encoding avoids idle-task scheduling, with a synchronous
-older-browser fallback. WebSocket JPEG compression is disabled in both service images.
+One JPEG encode and at most four outstanding frames at 15 FPS (eight at 30 FPS)
+bound active work. Unacknowledged JPEGs are persisted in a 512 MiB IndexedDB buffer;
+network stalls trigger reconnect and ordered, idempotent replay. Recorder queues
+apply backpressure; preview queues can drop frames. Session stop waits up to 600
+seconds for captured phone frames to flush. OffscreenCanvas JPEG encoding avoids
+idle-task scheduling, with a synchronous older-browser fallback. WebSocket JPEG
+compression is disabled in both service images.
 
 Serial discovery filters actual tty nodes to `/dev/ttyUSB[0-9]` and
 `/dev/ttyACM[0-9]`, retaining available stable by-id aliases. Validation checks the
@@ -90,3 +92,24 @@ USB capture disables exposure-driven dynamic frame rates by default, keeping aut
 exposure enabled. The option applies to preview, tests, and recording. Negotiated
 FPS, dimensions, pixel format, and exposure controls are included in diagnostics;
 metadata-only UVC device nodes are omitted from camera discovery.
+
+
+The Train workspace uses a separate internal FastAPI service and ROCm container.
+The backend proxies an explicit training API allowlist. The worker holds a process
+lease on the GPU job database and a per-session file lock shared with session
+removal. It launches one cancellable subprocess per job, persists status in
+`app/training.sqlite`, and captures stage progress/logs under `train/runs/<job-id>`.
+No Docker socket or host virtual environment is exposed. Training endpoints remain
+off the public phone listener.
+
+Pose labeling decodes actual MP4 PTS and verifies every frame against the saved
+Parquet index. Label times are mapped to schema 1.2 capture timestamps (falling back
+to legacy host receipt timestamps). CSI preprocessing rejects unsupported layouts
+and poorly covered windows; it never modifies raw files. The supplied ResNet18
+backbone loads from a session-local copy of the original checkpoint. Its classifier
+is replaced with a head for this session's labels. All receivers and overlapping
+windows in a labeled interval remain together in the train/validation split.
+Complete stage outputs are published separately; immutable run directories and an
+atomic `train/model.json` pointer identify the matching model, classes, labels,
+settings and metrics. Interrupted jobs retain their partial run and become failed
+on worker restart. See README for output paths and deployment commands.

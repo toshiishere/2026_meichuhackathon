@@ -119,3 +119,54 @@ def test_backend_registry_artifacts_and_request_validation(tmp_path, monkeypatch
         assert (
             client.post("/api/devices/remove", json={"identity": ""}).status_code == 422
         )
+
+
+def test_training_proxy_validates_session_and_operations(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DATA", tmp_path)
+    root = tmp_path / "sessions/session1"
+    root.mkdir(parents=True)
+    atomic_json(
+        root / "metadata.json",
+        dict(schema_version="1.0", session_id="session1", status="complete"),
+    )
+    calls = []
+
+    async def training(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"status": "queued"}
+
+    monkeypatch.setattr(main, "training_request", training)
+    with TestClient(main.app) as client:
+        assert (
+            client.post(
+                "/api/train/sessions/session1/start", json={"action": "auto"}
+            ).status_code
+            == 200
+        )
+        assert calls[-1][1] == "/sessions/session1/start"
+        assert calls[-1][2]["json"]["epochs_frozen"] == 5
+        assert (
+            client.post(
+                "/api/train/sessions/session1/start", json={"action": "shell"}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/train/sessions/no-session/start", json={"action": "label"}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/api/train/sessions/session1/start",
+                json={"action": "auto"},
+                headers={"Origin": "https://other.example"},
+            ).status_code
+            == 403
+        )
+        assert client.get("/api/train/jobs/bad/logs").status_code == 404
+        assert (
+            client.post("/api/train/jobs/" + "a" * 32 + "/delete", json={}).status_code
+            == 404
+        )
