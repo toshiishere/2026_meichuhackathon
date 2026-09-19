@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import re
 import shutil
 import threading
@@ -330,12 +331,91 @@ def pair_phone(body: PhonePairRequest):
 async def phone_stream(socket: WebSocket):
     # The LAN proxy exposes only this token-authenticated upload endpoint.
     await socket.accept()
-    pid, connected = None, False
+    pid, connected, connection_id = None, False, None
     try:
         auth = await asyncio.wait_for(socket.receive_json(), timeout=15)
         if not isinstance(auth, dict) or not isinstance(auth.get("id"), str):
             raise ValueError("Invalid phone handshake")
         pid = auth["id"]
+        if auth.get("protocol") == 2:
+            settings = (
+                hub.resume_settings(pid, auth.get("resume_token"))
+                if auth.get("resume_token")
+                else hub.settings(pid, auth.get("token"))
+            )
+            await socket.send_json(
+                {
+                    "type": "settings",
+                    **settings,
+                    "resume_token": hub.phones[pid].resume_token,
+                }
+            )
+            ready = await asyncio.wait_for(socket.receive_json(), timeout=120)
+            if not isinstance(ready, dict) or ready.get("type") != "ready":
+                raise ValueError("Expected phone camera readiness")
+            response = await asyncio.to_thread(
+                hub.connect_resumable, pid, auth, ready.get("native_resolution")
+            )
+            connection_id, connected = response["connection_id"], True
+            await socket.send_json(response)
+            probes = {}
+            while True:
+                message = await asyncio.wait_for(socket.receive(), timeout=20)
+                stamp = time.monotonic_ns()
+                if message["type"] == "websocket.disconnect":
+                    break
+                if message.get("bytes") is not None:
+                    result = await asyncio.to_thread(
+                        hub.accept_frame, pid, message["bytes"], stamp, connection_id
+                    )
+                else:
+                    data = json.loads(message.get("text", ""))
+                    kind = data.get("type")
+                    if kind == "clock":
+                        if len(probes) >= 8:
+                            raise ValueError("Too many phone clock probes")
+                        nonce = uuid.uuid4().hex
+                        sent = data.get("client_ms")
+                        if not isinstance(sent, (int, float)) or not math.isfinite(
+                            sent
+                        ):
+                            raise ValueError("Invalid phone clock probe")
+                        probes[nonce] = (stamp, sent)
+                        result = dict(type="clock", probe=nonce, client_ms=sent)
+                    elif kind == "clock_commit":
+                        host, sent = probes[data["probe"]]
+                        mid = data["client_mid_ms"]
+                        hub.calibrate(pid, connection_id, host, mid, mid - sent)
+                        probes.clear()
+                        result = dict(type="synced")
+                    elif kind in {"heartbeat", "finish"}:
+                        result = hub.progress(pid, connection_id, data)
+                    else:
+                        raise ValueError("Unknown phone message")
+                await socket.send_json(result)
+        else:
+            await phone_stream_legacy(socket, pid, auth)
+        return
+    except asyncio.TimeoutError:
+        await socket.close(code=1012)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await socket.send_json(
+                {"type": "error", "message": str(e) or "Phone connection failed"}
+            )
+            await socket.close(code=1008)
+        except Exception:
+            pass
+    finally:
+        if connected:
+            hub.disconnect(pid, connection_id)
+
+
+async def phone_stream_legacy(socket, pid, auth):
+    connected = False
+    try:
         settings = hub.settings(pid, auth.get("token"))
         await socket.send_json({"type": "settings", **settings})
         ready = await asyncio.wait_for(socket.receive_json(), timeout=120)

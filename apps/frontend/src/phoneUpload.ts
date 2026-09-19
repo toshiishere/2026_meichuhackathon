@@ -1,3 +1,4 @@
+import { PhoneBuffer } from "./phoneBuffer";
 export type UploadStats = {
   frames: number;
   skipped: number;
@@ -7,25 +8,31 @@ export type UploadStats = {
   ackMs: number;
   inFlight: number;
   maxInFlight: number;
+  bufferedFrames: number;
+  bufferedBytes: number;
 };
 
-// Capture/encoding is independent of acknowledgement latency. Keep both the
-// encoder and network queues bounded; never build a backlog of camera frames.
+// Persist before sending. Network retries never hold up camera capture.
 export function startPhoneUpload(
   video: HTMLVideoElement,
-  socket: WebSocket,
+  buffer: PhoneBuffer,
   settings: { width: number; height: number; fps: number },
   onStats: (stats: UploadStats) => void,
   onError: (error: Error) => void,
+  onNetworkStall: () => void,
 ) {
   const period = 1000 / settings.fps;
   const maxInFlight = Math.min(8, Math.max(2, Math.ceil(settings.fps / 4)));
   const pending = new Map<number, number>();
   let stopped = false,
     encoding = false,
-    sequence = 0,
-    skipped = 0,
-    delivered = 0;
+    paused = buffer.meta.paused,
+    skipped = buffer.meta.skipped;
+  let socket: WebSocket | null = null;
+  let lastSent = -1,
+    pumping = false,
+    captureStamp = 0;
+  let encodingTask: Promise<void> = Promise.resolve();
   let encodeMs = 0,
     ackMs = 0,
     lastMediaTime = -1;
@@ -64,7 +71,8 @@ export function startPhoneUpload(
   }
   function fail(message: string) {
     if (stopped) return;
-    cancel();
+    paused = true;
+    void buffer.update({ paused: true }).catch(() => {});
     onError(new Error(message));
   }
   function rate(times: number[], now: number) {
@@ -75,6 +83,7 @@ export function startPhoneUpload(
   async function encodeFrame(captureMs: number) {
     encoding = true;
     encodingSince = performance.now();
+    captureStamp = captureMs;
     try {
       context.fillStyle = "black";
       context.fillRect(0, 0, canvas.width, canvas.height);
@@ -104,26 +113,13 @@ export function startPhoneUpload(
         jpeg = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.8 });
       }
       encodeMs = performance.now() - encodingSince;
-      if (stopped || socket.readyState !== WebSocket.OPEN) return;
+      if (stopped) return;
       if (jpeg.type !== "image/jpeg" || jpeg.size + 20 > 2 * 1024 * 1024)
         throw new Error(
           "Phone JPEG is unsupported or exceeds the 2 MiB frame limit.",
         );
-      if (socket.bufferedAmount > 0) {
-        skipped++;
-        return;
-      }
-      const index = sequence++;
-      const header = new ArrayBuffer(20);
-      const view = new DataView(header);
-      view.setUint32(0, 0x43534931); // CSI1, unchanged wire format.
-      view.setUint32(4, index);
-      view.setFloat64(8, captureMs);
-      view.setUint32(16, skipped);
-      pending.set(index, performance.now());
-      // Send the encoded Blob directly; avoid copying the JPEG through an
-      // ArrayBuffer and another Uint8Array before every WebSocket send.
-      socket.send(new Blob([header, jpeg]));
+      await buffer.append(jpeg, captureMs, skipped);
+      void pump();
     } catch (error) {
       fail((error as Error).message || "Phone JPEG encoding failed.");
     } finally {
@@ -131,8 +127,7 @@ export function startPhoneUpload(
     }
   }
   function capture(mediaTime: number) {
-    if (stopped || socket.readyState !== WebSocket.OPEN || video.readyState < 2)
-      return;
+    if (stopped || paused || video.readyState < 2) return;
     if (mediaTime <= lastMediaTime) return;
     lastMediaTime = mediaTime;
     const now = performance.now();
@@ -146,11 +141,11 @@ export function startPhoneUpload(
         ? cameraMs + period
         : nextDue +
           Math.max(1, Math.floor((cameraMs - nextDue) / period) + 1) * period;
-    if (encoding || pending.size >= maxInFlight || socket.bufferedAmount > 0) {
+    if (encoding) {
       skipped++;
       return;
     }
-    void encodeFrame(now);
+    encodingTask = encodeFrame(buffer.now());
   }
   function schedule() {
     if (stopped) return;
@@ -170,17 +165,17 @@ export function startPhoneUpload(
     const now = performance.now();
     const oldest = pending.values().next().value;
     if (oldest !== undefined && now - oldest > 5000) {
-      fail(
-        "The collector stopped acknowledging frames. Check Wi-Fi and pair again.",
-      );
-      return;
+      socket = null;
+      pending.clear();
+      onNetworkStall();
     }
     if (encoding && now - encodingSince > 5000) {
       fail("Phone JPEG encoding stalled. Restart the phone camera.");
       return;
     }
+    void pump();
     onStats({
-      frames: delivered,
+      frames: buffer.meta.nextSequence - buffer.meta.count,
       skipped,
       cameraFps: rate(cameraTimes, now),
       deliveredFps: rate(deliveredTimes, now),
@@ -188,19 +183,75 @@ export function startPhoneUpload(
       ackMs,
       inFlight: pending.size,
       maxInFlight,
+      bufferedFrames: buffer.meta.count,
+      bufferedBytes: buffer.meta.bytes,
     });
   }, 250);
+  async function pump() {
+    if (pumping || stopped || !socket || socket.readyState !== WebSocket.OPEN)
+      return;
+    pumping = true;
+    const ws = socket;
+    try {
+      const free = maxInFlight - pending.size;
+      if (free <= 0 || ws.bufferedAmount > 2 * 1024 * 1024) return;
+      const frames = await buffer.batch(lastSent, free);
+      for (const frame of frames) {
+        if (stopped || socket !== ws || ws.readyState !== WebSocket.OPEN) break;
+        ws.send(frame.payload);
+        lastSent = frame.sequence;
+        pending.set(frame.sequence, performance.now());
+      }
+    } catch (e) {
+      fail((e as Error).message);
+    } finally {
+      pumping = false;
+    }
+  }
   schedule();
   return {
     stop: cancel,
-    ack(index: number) {
-      const sentAt = pending.get(index);
-      if (stopped || sentAt === undefined) return;
-      const now = performance.now();
-      ackMs = now - sentAt;
-      pending.delete(index);
-      delivered++;
+    detach() {
+      socket = null;
+      pending.clear();
+    },
+    async attach(ws: WebSocket, lastSequence: number) {
+      if (
+        !Number.isInteger(lastSequence) ||
+        lastSequence < -1 ||
+        lastSequence >= buffer.meta.nextSequence
+      )
+        throw new Error("Collector and saved phone sequence numbers disagree.");
+      await buffer.acknowledge(lastSequence);
+      pending.clear();
+      lastSent = lastSequence;
+      socket = ws;
+      void pump();
+    },
+    async pauseCapture() {
+      paused = true;
+      await encodingTask;
+      await buffer.update({ paused: true });
+    },
+    progress() {
+      return {
+        // Do not claim that capture has flushed past an encoding still in progress.
+        capture_ms: encoding ? Math.max(0, captureStamp - 0.001) : buffer.now(),
+        last_sequence: buffer.meta.nextSequence - 1,
+        buffered_frames: buffer.meta.count,
+      };
+    },
+    async ack(index: number) {
+      if (stopped) return;
+      if (!Number.isInteger(index) || index >= buffer.meta.nextSequence)
+        throw new Error("Collector acknowledged an unknown phone frame.");
+      const now = performance.now(),
+        sentAt = pending.get(index);
+      if (sentAt !== undefined) ackMs = now - sentAt;
+      await buffer.acknowledge(index);
+      for (const key of pending.keys()) if (key <= index) pending.delete(key);
       deliveredTimes.push(now);
+      void pump();
     },
   };
 }
