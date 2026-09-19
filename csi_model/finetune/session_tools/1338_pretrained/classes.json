@@ -1,0 +1,12 @@
+{
+  "class_names": [
+    "Static",
+    "Walking",
+    "Falling"
+  ],
+  "class_to_idx": {
+    "Static": 0,
+    "Walking": 1,
+    "Falling": 2
+  }
+}

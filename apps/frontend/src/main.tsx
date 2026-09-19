@@ -4,6 +4,7 @@ import "./style.css";
 import { Train } from "./Train";
 import { PhoneCamera, PhoneSetup } from "./PhoneCamera";
 import { RemoveSessionDialog } from "./RemoveSessionDialog";
+import { readApiResponse } from "./api";
 
 type Json = Record<string, any>;
 type Board = {
@@ -42,14 +43,7 @@ const api = async (path: string, body?: unknown) => {
           body: JSON.stringify(body),
         },
   );
-  const data = await response.json();
-  if (!response.ok)
-    throw new Error(
-      typeof data.detail === "string"
-        ? data.detail
-        : JSON.stringify(data.detail),
-    );
-  return data;
+  return readApiResponse(response);
 };
 const number = (v: unknown, places = 1) =>
   typeof v === "number" ? v.toFixed(places) : "—";
@@ -285,18 +279,27 @@ function App() {
   };
   useEffect(() => {
     run(refresh);
+    let refreshOnReconnect = false;
     const events = new EventSource("/api/events");
     events.onmessage = (e) => {
       const d = JSON.parse(e.data);
       if (d.error) {
+        refreshOnReconnect = true;
         setConnected(false);
         return;
       }
       setConnected(true);
       setJobs(d.jobs);
       setStatus(d.collection);
+      if (refreshOnReconnect) {
+        refreshOnReconnect = false;
+        run(refresh);
+      }
     };
-    events.onerror = () => setConnected(false);
+    events.onerror = () => {
+      refreshOnReconnect = true;
+      setConnected(false);
+    };
     return () => events.close();
   }, []);
   useEffect(() => {

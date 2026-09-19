@@ -6,6 +6,7 @@ import {
 } from "./phoneBuffer";
 import { QRCodeSVG } from "qrcode.react";
 import { startPhoneUpload, type UploadStats } from "./phoneUpload";
+import { readApiResponse } from "./api";
 
 function wideCameraScore(camera: MediaDeviceInfo) {
   const label = camera.label;
@@ -627,13 +628,7 @@ export function PhoneSetup({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, width, height, fps }),
       });
-      const data = await response.json();
-      if (!response.ok)
-        throw new Error(
-          typeof data.detail === "string"
-            ? data.detail
-            : JSON.stringify(data.detail),
-        );
+      const data = await readApiResponse(response);
       setLink(
         `${address.origin}/phone#${new URLSearchParams({ id: data.id, token: data.token })}`,
       );

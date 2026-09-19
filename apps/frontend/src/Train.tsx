@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { readApiResponse } from "./api";
 
 type Json = Record<string, any>;
 async function api(path: string, body?: Json) {
@@ -12,14 +13,7 @@ async function api(path: string, body?: Json) {
           body: JSON.stringify(body),
         },
   );
-  const data = await response.json();
-  if (!response.ok)
-    throw new Error(
-      typeof data.detail === "string"
-        ? data.detail
-        : JSON.stringify(data.detail),
-    );
-  return data;
+  return readApiResponse(response);
 }
 
 export function Train({ sessions }: { sessions: Json[] }) {
