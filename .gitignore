@@ -12,3 +12,4 @@ firmware/**/build/
 firmware/**/managed_components/
 csi_model/Model\ Code/Data/
 csi_model/Model\ Code/inference_kit/sample_data/
+*.mat

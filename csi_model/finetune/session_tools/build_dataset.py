@@ -16,12 +16,18 @@ only accept T=950; both were patched to accept any T (still validating the
 
 Label format (one file per session, CSV):
 
-    start_time_ms,end_time_ms,movement
+    start_time,end_time,label
 
-Times are ms from the start of the session video. `movement` must be one of
+Times are ms from the start of the session video. `label` must be one of
 Static, Walking, Sitting, Standing, Falling; anything else is an error. Each
 movement gets its own output folder. Time not covered by any row is simply
 not windowed.
+
+Ignoring the start of each session (--skip-seconds, default 3): label rows
+that end before N seconds are dropped, rows that straddle it are trimmed to
+start at N, and no window ever includes data before N. A trimmed row whose
+remainder is shorter than one window is dropped entirely. Labels in the file
+are never modified.
 
 Windowing policy:
 - Interval >= window: slide with stride = window * (1 - overlap), starting
@@ -75,28 +81,32 @@ def ensure_decompressed(session, receiver):
 
 
 MOVEMENTS = ["Static", "Walking", "Sitting", "Standing", "Falling"]
-LABEL_COLUMNS = ["start_time_ms", "end_time_ms", "movement"]
+LABEL_COLUMNS = ["start_time", "end_time", "label"]
 
 
 def load_labels(path):
-    """Read a label file with columns start_time_ms,end_time_ms,movement
-    (times in ms from the start of the session video). Returns a DataFrame
-    with start_s/end_s/label columns. Raises on malformed rows rather than
-    silently building windows -- or a stray class folder -- from a typo.
+    """Read a label file with columns start_time,end_time,label (times in ms
+    from the start of the session video; spaces after commas are fine).
+    Returns a DataFrame with start_s/end_s/label columns. Raises on malformed
+    rows rather than silently building windows -- or a stray class folder --
+    from a typo.
     """
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, skipinitialspace=True)
+    df.columns = df.columns.str.strip()
     missing = [c for c in LABEL_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError(f"{path}: missing columns {missing}; expected {LABEL_COLUMNS}")
-    bad = sorted(set(df["movement"].astype(str)) - set(MOVEMENTS))
+        raise ValueError(f"{path}: missing columns {missing}; expected {LABEL_COLUMNS}, "
+                         f"found {list(df.columns)}")
+    df["label"] = df["label"].astype(str).str.strip()
+    bad = sorted(set(df["label"]) - set(MOVEMENTS))
     if bad:
-        raise ValueError(f"{path}: unknown movement(s) {bad}; valid: {MOVEMENTS}")
-    if (df["end_time_ms"] <= df["start_time_ms"]).any():
-        raise ValueError(f"{path}: found rows with end_time_ms <= start_time_ms")
+        raise ValueError(f"{path}: unknown label(s) {bad}; valid: {MOVEMENTS}")
+    if (df["end_time"] <= df["start_time"]).any():
+        raise ValueError(f"{path}: found rows with end_time <= start_time")
     return pd.DataFrame({
-        "start_s": df["start_time_ms"] / 1000.0,
-        "end_s": df["end_time_ms"] / 1000.0,
-        "label": df["movement"],
+        "start_s": df["start_time"] / 1000.0,
+        "end_s": df["end_time"] / 1000.0,
+        "label": df["label"],
     })
 
 
@@ -104,19 +114,32 @@ def video_time_to_host_ns(video_frames, t_s):
     return float(np.interp(t_s, video_frames["video_pts_s"], video_frames["host_timestamp_ns"]))
 
 
-def make_windows(start_s, end_s, window_s, stride_s):
-    """Returns a list of (win_start_s, win_end_s) covering [start_s, end_s)."""
+# Label times can't be placed more precisely than about one video frame
+# (~67 ms at 15fps), and ms values divided by 1000 carry float rounding noise.
+# Without a tolerance, an event labeled 2000/2001/2010 ms against a 2 s window
+# yields two near-identical windows instead of one.
+EDGE_TOLERANCE_S = 0.1
+
+
+def make_windows(start_s, end_s, window_s, stride_s, min_start_s=0.0):
+    """Returns a list of (win_start_s, win_end_s) covering [start_s, end_s).
+
+    No window starts before min_start_s. A short event's centered window that
+    would reach earlier is shifted right rather than clipped: clipping would
+    shorten it, and resampling to a fixed length then stretches it in time.
+    """
     dur = end_s - start_s
-    if dur <= window_s:
+    if dur <= window_s + EDGE_TOLERANCE_S:
         mid = (start_s + end_s) / 2.0
-        return [(mid - window_s / 2.0, mid + window_s / 2.0)]
+        w_start = max(mid - window_s / 2.0, min_start_s)
+        return [(w_start, w_start + window_s)]
 
     windows = []
     t = start_s
-    while t + window_s <= end_s:
+    while t + window_s <= end_s + 1e-9:
         windows.append((t, t + window_s))
         t += stride_s
-    if not windows or windows[-1][1] < end_s:
+    if not windows or windows[-1][1] < end_s - EDGE_TOLERANCE_S:
         windows.append((end_s - window_s, end_s))
     return windows
 
@@ -141,7 +164,7 @@ def resample_window(csi, lltf_idx, ns0, ns1, n_samples):
 
 
 def process_session(session, out_dir, window_s, overlap, sample_rate_hz, receivers,
-                     labels_file, manifest_rows):
+                     labels_file, skip_s, manifest_rows):
     session_id = os.path.basename(os.path.normpath(session))
     labels_path = os.path.join(session, labels_file)
     if not os.path.exists(labels_path):
@@ -150,8 +173,31 @@ def process_session(session, out_dir, window_s, overlap, sample_rate_hz, receive
 
     labels = load_labels(labels_path)
 
+    if skip_s > 0:
+        n_before = len(labels)
+        labels = labels[labels["end_s"] > skip_s].copy()
+        was_cut = labels["start_s"] < skip_s
+        labels["start_s"] = labels["start_s"].clip(lower=skip_s)
+        # A row cut by the skip keeps only its tail. If that tail can't hold a
+        # full window, drop it: the fallback for short rows would pull in a
+        # window mostly made of neighbouring movements.
+        too_short = was_cut & ((labels["end_s"] - labels["start_s"]) < window_s - EDGE_TOLERANCE_S)
+        labels = labels[~too_short]
+        print(f"  {session_id}: ignoring first {skip_s:g}s -> "
+              f"{n_before} label rows, {len(labels)} kept")
+
     video_frames_path = os.path.join(session, "raw", "video_frames.parquet")
     video_frames = pq.read_table(video_frames_path).to_pandas()
+
+    # The header carries no unit, so guard against a unit mix-up (e.g. times
+    # written in seconds, or a label file from a different session): labels
+    # can't run meaningfully past the end of the video.
+    video_end_s = float(video_frames["video_pts_s"].max())
+    if len(labels) and labels["end_s"].max() > video_end_s + 1.0:
+        raise ValueError(
+            f"{labels_path}: a label ends at {labels['end_s'].max():.1f}s but the video is "
+            f"only {video_end_s:.1f}s long -- wrong units (expected ms) or wrong session?"
+        )
 
     stride_s = window_s * (1.0 - overlap)
     n_samples = round(window_s * sample_rate_hz)
@@ -168,7 +214,8 @@ def process_session(session, out_dir, window_s, overlap, sample_rate_hz, receive
     for interval_idx, (_, row) in enumerate(labels.iterrows()):
         label = row["label"]
         interval_id = f"{session_id}-interval{interval_idx:04d}"
-        wins = make_windows(row["start_s"], row["end_s"], window_s, stride_s)
+        wins = make_windows(row["start_s"], row["end_s"], window_s, stride_s,
+                             min_start_s=skip_s)
 
         for w_start, w_end in wins:
             ns0 = video_time_to_host_ns(video_frames, max(0, w_start))
@@ -210,13 +257,18 @@ def main():
     p.add_argument("--sample-rate-hz", type=float, default=100.0,
                     help="target samples/sec after resampling; T = round(window_seconds * this)")
     p.add_argument("--receivers", nargs="+", default=["left", "mid", "right"])
+    p.add_argument("--skip-seconds", type=float, default=3.0,
+                    help="ignore the first N seconds of each session (from video start); "
+                         "no window will include any data before this. 0 disables.")
     p.add_argument("--labels-file", default="pseudo_labels.csv",
-                    help="label CSV (start_time_ms,end_time_ms,movement), looked up "
+                    help="label CSV (start_time,end_time,label; ms), looked up "
                          "inside each session dir, or an absolute path")
     args = p.parse_args()
 
     if not (0.0 <= args.overlap < 1.0):
         raise ValueError("--overlap must be in [0, 1)")
+    if args.skip_seconds < 0:
+        raise ValueError("--skip-seconds must be >= 0")
 
     os.makedirs(args.out, exist_ok=True)
     n_samples = round(args.window_seconds * args.sample_rate_hz)
@@ -226,7 +278,8 @@ def main():
     manifest_rows = []
     for session in args.session:
         process_session(session, args.out, args.window_seconds, args.overlap,
-                         args.sample_rate_hz, args.receivers, args.labels_file, manifest_rows)
+                         args.sample_rate_hz, args.receivers, args.labels_file,
+                         args.skip_seconds, manifest_rows)
 
     manifest_path = os.path.join(args.out, "manifest.csv")
     with open(manifest_path, "w", newline="") as f:

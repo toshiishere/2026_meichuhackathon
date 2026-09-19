@@ -1,7 +1,7 @@
 [project]
-name = "CSI_HAR_Finetune"
+name = "visual-action-inference"
 version = "0.1.0"
-description = "HAR Finetune pipeline"
+description = "YOLOv8-Pose + CTR-GCN action recognition inference pipeline"
 requires-python = ">=3.12"
 dependencies = [
     "torch[device-gfx1152]==2.13.0+rocm10.0.0 ; sys_platform == 'linux'",
@@ -16,10 +16,8 @@ dependencies = [
     "rocm-bootstrap",
     "triton",
     "numpy",
-    "pandas",
-    "pyarrow",
-    "scipy",
-    "scikit-learn",
+    "opencv-python",
+    "ultralytics",
 ]
 
 # torch/torchvision/torchaudio, plus the ROCm SDK packages they pull in
