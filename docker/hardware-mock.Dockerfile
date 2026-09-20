@@ -4,6 +4,7 @@ COPY apps/common/requirements.txt apps/common/requirements.txt
 COPY apps/hardware_service/requirements.txt apps/hardware_service/requirements.txt
 RUN pip install --no-cache-dir -r apps/hardware_service/requirements.txt
 COPY apps apps
+COPY dc_bot dc_bot
 COPY configs configs
 COPY firmware firmware
 COPY scripts scripts
