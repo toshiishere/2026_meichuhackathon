@@ -1,5 +1,6 @@
 """The alert bot: token handling, message shape, and refusing to send blind."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -55,6 +56,17 @@ def test_messages_keep_the_bot_wording_and_add_detail():
     assert "未知事件通知：dancing" in alert_module.message_for("dancing")
 
 
+def test_the_walking_total_is_worded_by_the_bot_around_the_count():
+    assert alert_module.message_for("walking_total", seconds=137.4).startswith(
+        "🚶 使用者已經走了 137 秒"
+    )
+    summary = alert_module.message_for("walking_total", "replay of session x", 12.4)
+    assert summary.startswith("🚶 使用者已經走了 12 秒")
+    assert summary.endswith("replay of session x")
+    # A count that never arrives still reads as a sentence, not a template.
+    assert "{" not in alert_module.message_for("walking_total")
+
+
 def test_alert_endpoint_posts_to_discord(offline):
     sent = []
 
@@ -80,6 +92,31 @@ def test_alert_endpoint_posts_to_discord(offline):
     assert sent[0]["url"] == "https://discord.com/api/v10/channels/42/messages"
     assert sent[0]["auth"] == f"Bot {TOKEN}"
     assert alert_module.EVENT_MESSAGES["falling"] in sent[0]["body"]
+
+
+def test_alert_endpoint_sends_the_walking_total_with_its_count(offline):
+    sent = []
+
+    def handler(request):
+        sent.append(request.read().decode())
+        return httpx.Response(200, json={"id": "1"})
+
+    with TestClient(bot_module.app) as client:
+        client.app.state.client = discord(handler)
+        result = client.post(
+            "/alert",
+            json={"event": "walking_total", "detail": "live capture", "seconds": 42.4},
+        )
+        assert result.status_code == 200, result.text
+        assert result.json()["content"].startswith("🚶 使用者已經走了 42 秒")
+        # The count is a duration, not free text.
+        assert (
+            client.post(
+                "/alert", json={"event": "walking_total", "seconds": -1}
+            ).status_code
+            == 422
+        )
+    assert "使用者已經走了 42 秒" in json.loads(sent[0])["content"]
 
 
 def test_alert_endpoint_reports_a_missing_token_and_a_refusing_discord(

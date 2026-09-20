@@ -563,9 +563,10 @@ export function Deploy({
           />
           <span>
             Send a Discord alert when a fall is followed by 2 s of stillness
-            within 4 s. Measured on the recording’s own clock, so replay speed
-            does not change when an alert fires — replays alert too, and say so
-            in the message.
+            within 4 s, and a walking total (使用者已經走了 XX 秒) when the
+            deployment stops. Measured on the recording’s own clock, so replay
+            speed does not change when an alert fires — replays alert too, and
+            say so in the message.
           </span>
         </label>
         <div className="actions">
@@ -777,6 +778,23 @@ export function Deploy({
         {state.notify_error && (
           <p className="notice warning">
             Discord alert could not be sent: {state.notify_error}
+          </p>
+        )}
+        {state.walking_seconds !== undefined && (
+          <p className="subtle" role="status">
+            {state.walking
+              ? `Walking total for this deployment: ${Number(state.walking.seconds).toFixed(1)}s`
+              : `Walking time so far: ${Number(state.walking_seconds).toFixed(1)}s`}
+            {state.walking &&
+              ` · Discord summary ${
+                state.walking.notified
+                  ? "sent"
+                  : state.walking.error
+                    ? `failed: ${state.walking.error}`
+                    : !state.notify
+                      ? "not sent (alerts off)"
+                      : "not sent (no walking detected)"
+              }`}
           </p>
         )}
         {!!state.falls?.length && (

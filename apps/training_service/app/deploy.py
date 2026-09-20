@@ -31,7 +31,14 @@ from .preprocess import (
     packet_rows,
     resample_window,
 )
-from .alerts import FallWatcher, bot_health, describe, notify
+from .alerts import (
+    FallWatcher,
+    WalkWatcher,
+    bot_health,
+    describe,
+    describe_walk,
+    notify,
+)
 from .playback import ensure_playable_video
 from .timeline import Timeline
 
@@ -376,6 +383,8 @@ class Deployment:
                     history=[],
                     notify=options.notify,
                     falls=[],
+                    walking_seconds=0.0,
+                    walking=None,
                     notify_error=None,
                     compute="npu_xint8" if options.use_npu else "rocm_gpu",
                     receiver_names=names,
@@ -440,6 +449,37 @@ class Deployment:
 
         threading.Thread(target=send, daemon=True).start()
 
+    def _record_walk(self, options, seconds, receivers):
+        """One summary when the run ends: how long the person walked in total."""
+        summary = dict(
+            seconds=round(seconds, 1),
+            detail=describe_walk(seconds, options, receivers),
+            notified=False,
+            error=None,
+        )
+        with self.guard:
+            self.state["walking"] = summary
+            self.state["walking_seconds"] = summary["seconds"]
+            enabled = bool(self.state.get("notify"))
+        # Nothing to report when the person never walked.
+        if not enabled or summary["seconds"] <= 0:
+            return
+
+        def send():
+            try:
+                notify("walking_total", summary["detail"], seconds=summary["seconds"])
+                with self.guard:
+                    summary["notified"] = True
+                    self.state["notify_error"] = None
+            except Exception as error:
+                # The summary is the last word of a finished run, never a reason
+                # to report the run itself as failed.
+                with self.guard:
+                    summary["error"] = str(error)
+                    self.state["notify_error"] = str(error)
+
+        threading.Thread(target=send, daemon=True).start()
+
     def stop(self):
         with self.guard:
             if self.state["status"] in ACTIVE:
@@ -455,6 +495,7 @@ class Deployment:
     def _run(self, options, metadata, checkpoint, classes, replays, leases):
         capture_id, predictor = None, None
         client = None
+        walker, names = None, []
         final_status, failure = "stopped", None
         try:
             client = httpx.Client(
@@ -505,6 +546,7 @@ class Deployment:
                 for name in names
             }
             watcher = FallWatcher()
+            walker = WalkWatcher(prep["window_seconds"])
             duration = buffers[names[0]].duration
             stride = max(100_000_000, round(duration * (1 - prep["overlap"])))
             if options.source == "live" or options.camera:
@@ -690,8 +732,14 @@ class Deployment:
                                 uncovered_receivers=uncovered,
                             )
                             history = self.snapshot()["history"][-29:] + [prediction]
+                            # Walking time accumulates across the whole run and
+                            # is reported once, when the deployment stops.
+                            walked = walker.observe(prediction["label"], elapsed)
                             self.update(
-                                signal="ready", prediction=prediction, history=history
+                                signal="ready",
+                                prediction=prediction,
+                                history=history,
+                                walking_seconds=round(walked, 1),
                             )
                             last_predict = end
                             # Source seconds, so a replay at any speed alerts at
@@ -731,6 +779,12 @@ class Deployment:
                 try:
                     leases.close()
                 finally:
+                    try:
+                        # The run's last word: how long the walking added up to.
+                        if walker is not None:
+                            self._record_walk(options, walker.total, names)
+                    except Exception as error:
+                        self.update(notify_error=str(error))
                     self.update(
                         status=final_status,
                         error=failure,

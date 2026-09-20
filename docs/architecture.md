@@ -160,4 +160,6 @@ Fall alerting runs in the worker, not the browser, so a replay alerts with no UI
 attached. It watches the fused predictions on the source clock and posts to the
 `dc-bot` service, which owns the Discord gateway session and the bot token; the
 worker holds no credentials, and a send failure is recorded in deployment status
-without touching the inference loop.
+without touching the inference loop. The same watcher path totals Walking time
+over the run and posts it once when the run ends, so the total covers the whole
+deployment rather than whatever the browser happened to be polling.

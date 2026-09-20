@@ -19,6 +19,7 @@ test("the operator turns fall alerts on and off while a deployment runs", async 
       camera: null,
       notify: false,
     },
+    walking_seconds: 18.4,
     falls: [
       {
         fell_at_s: 44.5,
@@ -77,4 +78,62 @@ test("the operator turns fall alerts on and off while a deployment runs", async 
   await toggle.uncheck();
   await expect.poll(() => toggles).toEqual([true, false]);
   await expect(toggle).not.toBeChecked();
+});
+
+test("the walking total counts up and is reported when the run ends", async ({
+  page,
+}) => {
+  const state: any = {
+    id: "run",
+    status: "running",
+    signal: "ready",
+    notify: true,
+    receiver_names: ["left"],
+    options: {
+      model_session_id: "trained",
+      source: "replay",
+      replay_session_id: "recorded",
+      replay_receivers: ["left"],
+      replay_speed: 4,
+      camera: null,
+      notify: true,
+    },
+    falls: [],
+    walking_seconds: 12.3,
+    walking: null,
+  };
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/events") {
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body: 'data: {"collection":{"status":"idle"},"jobs":[]}\n\n',
+      });
+      return;
+    }
+    let data: any = [];
+    if (path === "/api/health") data = { hardware: { mode: "synthetic" } };
+    if (path === "/api/deploy/catalog")
+      data = { models: [], sources: [], errors: [] };
+    if (path === "/api/deploy/status") data = state;
+    await route.fulfill({ json: data });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+
+  await expect(page.getByText("Walking time so far: 12.3s")).toBeVisible();
+  // Stopping the deployment settles the total and sends it to Discord.
+  state.status = "completed";
+  state.walking_seconds = 31.7;
+  state.walking = {
+    seconds: 31.7,
+    detail: "replay",
+    notified: true,
+    error: null,
+  };
+  await expect(
+    page.getByText(
+      "Walking total for this deployment: 31.7s · Discord summary sent",
+    ),
+  ).toBeVisible();
 });

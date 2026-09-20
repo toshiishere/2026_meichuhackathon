@@ -241,7 +241,10 @@ Deploy decides whether anything is sent; falls are detected and listed either
 way. A fall alerts when Static predictions span 2 seconds within the 4 seconds after
 a Falling prediction (a stray other action in between does not reset the span),
 measured on the capture or recording's own clock — replay speed does not change it, replays alert too, and the message says
-when it came from a replay. See docs/demo-controls.md.
+when it came from a replay. The same switch also sends one walking total when
+the run stops (`使用者已經走了 XX 秒`): Walking predictions are added up across
+the whole run on that same clock, shown live in Deploy, and a run without any
+walking sends nothing. See docs/demo-controls.md.
 
 Training and deployment remain mutually exclusive through the worker operation
 lock, including NPU deployment. Live deployment

@@ -96,7 +96,7 @@ statistics remain intact: recovered does not mean good-quality data. Active
 acquisition threads and busy sessions cannot be recovered. No existing session
 is recovered or deleted automatically.
 
-## Fall alerts to Discord
+## Fall alerts and the walking total to Discord
 
 `make up` starts a `dc-bot` service alongside the collector. It holds a Discord
 gateway session, which is what makes a bot appear **online** — REST calls alone
@@ -111,8 +111,8 @@ recreating the container (`make up` does this).
 Deploy has a **Send a Discord alert when a fall is detected** switch. It can be
 turned on before starting and flipped during a run; turning it on asks the bot
 whether it is online and says so immediately rather than staying silent until a
-fall happens. Falls are always detected and listed in the Deploy panel — the
-switch only decides whether anything leaves this machine.
+fall happens. Falls and walking time are always measured and shown in the
+Deploy panel — the switch only decides whether anything leaves this machine.
 
 The rule, applied to the fused pose predictions:
 
@@ -135,3 +135,21 @@ which session was replayed so nobody reads a demo as a live emergency. The
 message itself is the bot's existing wording, with the detection detail
 appended. A failed or refused send is reported in Deploy and never interrupts
 inference.
+
+### The walking total
+
+Alongside the fall rule, deployment totals how long the person walked, from the
+moment a replay or live capture starts until the run stops. Each fused
+prediction stands for the span until the next one, so a prediction labelled
+**Walking** adds the seconds until the following prediction, up to one model
+window — a gap in predictions means predictions stopped, not that the walk
+continued through it. Deploy shows the running total while the run is going and
+the settled total once it ends.
+
+When the run stops — by the Stop button, by a replay reaching its end, or by a
+failure — the total is sent once as `使用者已經走了 XX 秒`, with a context line
+saying whether the seconds came from a live capture or from a replay of a named
+recording. The seconds are source seconds like every other time here, so a
+recording replayed at 4x reports the same total as at 1x. A run in which nobody
+walked sends nothing: nought seconds is not news. The bot owns the sentence;
+deployment supplies only the count, in the `seconds` field of `POST /alert`.

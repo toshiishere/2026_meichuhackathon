@@ -3,7 +3,8 @@
 `make up` starts this alongside the collector. Holding a Discord gateway session
 is what makes a bot appear online — REST calls alone leave it grey — so this
 service keeps one open, identifying and heartbeating, and reconnects on its own.
-Deployment posts to /alert when it detects a fall.
+Deployment posts to /alert when it detects a fall, and once more with the
+walking total when a run stops.
 """
 
 import asyncio
@@ -47,6 +48,8 @@ class AlertRequest(BaseModel):
     event: str = Field(min_length=1, max_length=40)
     detail: str = Field(default="", max_length=1500)
     channel_id: str = Field(default="", max_length=40)
+    # Counted events (the walking total) word their sentence around this.
+    seconds: float | None = Field(default=None, ge=0, le=86400)
 
 
 async def heartbeat(socket, interval, sequence):
@@ -171,7 +174,7 @@ async def alert(body: AlertRequest):
     if not token:
         raise HTTPException(503, "DISCORD_BOT_TOKEN is not set; alerts are disabled")
     channel = body.channel_id or default_channel()
-    content = message_for(body.event, body.detail)
+    content = message_for(body.event, body.detail, body.seconds)
     try:
         response = await app.state.client.post(
             f"{API}/channels/{channel}/messages",

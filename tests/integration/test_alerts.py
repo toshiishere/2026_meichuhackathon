@@ -1,4 +1,4 @@
-"""Fall alerting: the rule itself, and that a deployment sends it exactly once."""
+"""Alerting: the fall rule, the walking total, and what a deployment sends."""
 
 import threading
 import time
@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 
 from apps.common.schemas import DeployRequest, NotifyRequest
 from apps.training_service.app import deploy, main
-from apps.training_service.app.alerts import FallWatcher, describe
+from apps.training_service.app.alerts import (
+    FallWatcher,
+    WalkWatcher,
+    describe,
+    describe_walk,
+)
 from test_deploy import (
     RecordingPredictor,
     model_fixture,
@@ -105,6 +110,64 @@ def test_alerting_depends_on_source_time_not_on_replay_speed():
     results = [fast.observe(label, at) for label, at in predictions]
     assert results[-1] == (20.0, 2.0)
     assert slow.alerted_at == fast.alerted_at == 23.0
+
+
+def test_walking_time_adds_up_across_the_whole_run():
+    walker = WalkWatcher(window_seconds=2.0)
+    # Each prediction stands until the next one, so the two Walking seconds
+    # before the person stops are counted and the Static span is not.
+    for label, at in [
+        ("Static", 0.0),
+        ("Walking", 1.0),
+        ("Walking", 2.0),
+        ("Static", 3.0),
+        ("Static", 4.0),
+        ("Walking", 5.0),
+    ]:
+        walker.observe(label, at)
+    assert walker.total == pytest.approx(2.0)
+    # The walk still running at the last prediction is counted from there on.
+    assert walker.observe("Walking", 6.0) == pytest.approx(3.0)
+    assert walker.observe("Static", 7.0) == pytest.approx(4.0)
+
+
+def test_a_gap_in_predictions_is_not_credited_to_the_walk():
+    walker = WalkWatcher(window_seconds=2.0)
+    walker.observe("Walking", 0.0)
+    # Predictions stopped for a minute; a walk is only ever worth the window
+    # the prediction was made from.
+    assert walker.observe("Walking", 60.0) == pytest.approx(2.0)
+    assert walker.observe("Static", 61.0) == pytest.approx(3.0)
+
+
+def test_the_walking_total_counts_source_seconds_not_wall_clock():
+    """The same recording totals the same seconds at 1x and at 4x."""
+    predictions = [("Walking", 1.0), ("Walking", 2.0), ("Static", 3.0)]
+    slow, fast = WalkWatcher(), WalkWatcher()
+    for label, at in predictions:
+        slow.observe(label, at)
+        time.sleep(0.01)  # Wall-clock pacing differs; source seconds do not.
+    for label, at in predictions:
+        fast.observe(label, at)
+    assert slow.total == fast.total == pytest.approx(2.0)
+
+
+def test_the_walking_summary_says_which_source_it_counted(tmp_path):
+    options = DeployRequest(
+        model_session_id="trained",
+        source="replay",
+        replay_session_id="recorded",
+        replay_receivers=["left"],
+        replay_speed=4,
+    )
+    detail = describe_walk(12.5, options, ["left", "right"])
+    assert "replay of recorded session recorded" in detail and "12.5" in detail
+    live = DeployRequest(
+        model_session_id="trained",
+        source="live",
+        receivers=[dict(logical_name="rx", port="synthetic://rx0")],
+    )
+    assert "live capture" in describe_walk(3.0, live, ["rx"])
 
 
 def test_a_replay_alert_says_it_is_a_replay(tmp_path):
@@ -223,6 +286,116 @@ def test_detection_without_sending_when_alerts_are_switched_off(tmp_path, monkey
     # The fall is still detected and reported in the UI, just never sent.
     assert state["falls"] and not state["falls"][0]["notified"]
     assert state["notify"] is False
+
+
+class WalkingPredictor(RecordingPredictor):
+    """Always Walking, so the whole replay counts toward the walking total."""
+
+    def scores(self, windows):
+        import numpy as np
+
+        # classes are ["Static", "Walking"].
+        return np.array([[0.1, 0.9]] * len(windows)), 1.0
+
+
+def run_walking_replay(tmp_path, monkeypatch, notify, sender):
+    session = multi_receiver_session(tmp_path, names=("left",))
+    monkeypatch.setattr(deploy, "Predictor", WalkingPredictor)
+    monkeypatch.setattr(deploy, "notify", sender)
+    manager = deploy.Deployment(tmp_path, threading.Lock(), main.session_path)
+    manager.start(
+        DeployRequest(
+            model_session_id=session.name,
+            source="replay",
+            replay_session_id=session.name,
+            replay_receivers=["left"],
+            replay_speed=4,
+            notify=notify,
+        )
+    )
+    try:
+        wait_for(lambda: manager.snapshot()["status"] == "completed", timeout=20)
+    finally:
+        manager.close()
+    return manager
+
+
+def test_a_finished_deployment_reports_how_long_the_walking_lasted(
+    tmp_path, monkeypatch
+):
+    posted = []
+
+    def fake_notify(event, detail, seconds=None, timeout=5):
+        posted.append((event, detail, seconds))
+        return dict(sent=True)
+
+    manager = run_walking_replay(tmp_path, monkeypatch, True, fake_notify)
+    state = manager.snapshot()
+    # The recording holds eight seconds of CSI, walked from the first window on.
+    assert state["walking_seconds"] >= 5
+    summary = state["walking"]
+    assert summary["seconds"] == state["walking_seconds"]
+    wait_for(lambda: manager.snapshot()["walking"]["notified"])
+    assert [event for event, _, _ in posted] == ["walking_total"]
+    event, detail, seconds = posted[0]
+    # The bot words the sentence; the deployment supplies the count and says
+    # plainly that these seconds came from a replay.
+    assert seconds == summary["seconds"]
+    assert "replay of recorded session" in detail
+    assert not state["falls"]
+
+
+def test_the_walking_total_stays_on_the_machine_when_alerts_are_off(
+    tmp_path, monkeypatch
+):
+    def refuse(*args, **kwargs):
+        raise AssertionError("no total may leave the machine while notify is off")
+
+    manager = run_walking_replay(tmp_path, monkeypatch, False, refuse)
+    state = manager.snapshot()
+    # Counted and shown in the UI all the same, just never sent.
+    assert state["walking_seconds"] >= 5
+    assert state["walking"]["notified"] is False
+
+
+def test_a_deployment_without_walking_sends_no_total(tmp_path, monkeypatch):
+    session = multi_receiver_session(tmp_path, names=("left",))
+    from apps.common.storage import atomic_json
+
+    run = session / "train/runs" / ("a" * 32)
+    atomic_json(
+        run / "classes.json",
+        dict(
+            class_names=["Falling", "Static"], class_to_idx={"Falling": 0, "Static": 1}
+        ),
+    )
+    monkeypatch.setattr(deploy, "Predictor", FallingPredictor)
+    posted = []
+    monkeypatch.setattr(
+        deploy,
+        "notify",
+        lambda event, detail, **kwargs: posted.append(event) or dict(sent=True),
+    )
+    manager = deploy.Deployment(tmp_path, threading.Lock(), main.session_path)
+    manager.start(
+        DeployRequest(
+            model_session_id=session.name,
+            source="replay",
+            replay_session_id=session.name,
+            replay_receivers=["left"],
+            replay_speed=4,
+            notify=True,
+        )
+    )
+    try:
+        wait_for(lambda: manager.snapshot()["status"] == "completed", timeout=20)
+    finally:
+        manager.close()
+    state = manager.snapshot()
+    assert state["walking_seconds"] == 0 and state["walking"]["seconds"] == 0
+    # A fall is worth a message; nought seconds of walking is not.
+    wait_for(lambda: posted == ["falling"])
+    assert posted == ["falling"]
 
 
 def test_notify_toggle_is_validated_and_reaches_the_worker(tmp_path, monkeypatch):
